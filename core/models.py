@@ -89,6 +89,7 @@ class BookingConfig:
     boarding_point: Optional[str] = None
     book_only_if_confirmed: bool = True
     captcha_api_key: Optional[str] = None
+    quota: str = "TATKAL"  # "TATKAL", "PREMIUM TATKAL", "GENERAL", "LADIES", etc.
 
     # Admin HITL: WhatsApp number that receives CAPTCHA images and has 10s to reply.
     # For personal use this is the same as the passenger's number.

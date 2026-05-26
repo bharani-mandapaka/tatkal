@@ -184,6 +184,7 @@ def _build_config(raw: dict):
         payment=payment,
         book_only_if_confirmed=raw.get("book_only_if_confirmed", True),
         captcha_api_key=raw.get("captcha_api_key"),
+        quota=raw.get("quota", "TATKAL"),
     )
 
 

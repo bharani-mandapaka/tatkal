@@ -45,13 +45,12 @@ async def _handle_upi(page: Page, config: PaymentConfig, notifier: Notifier) -> 
     await page.locator(
         "label:has-text('UPI'), input[value='UPI']"
     ).first.click()
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(0.05)   # React tick
 
     upi_inp = page.locator(
         "input[placeholder*='UPI'], input[placeholder*='VPA'], input[id*='upiId']"
     ).first
     await upi_inp.fill(config.upi_id or "")
-    await asyncio.sleep(0.3)
 
     await page.locator("button:has-text('Pay')").first.click()
 

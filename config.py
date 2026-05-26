@@ -7,8 +7,11 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-CONFIG_PATH = Path("booking_config.enc")
-SALT_PATH = Path("booking_salt.bin")
+# Anchored to the directory this file lives in so config is found
+# regardless of the Python process's working directory.
+_HERE = Path(__file__).resolve().parent
+CONFIG_PATH = _HERE / "booking_config.enc"
+SALT_PATH   = _HERE / "booking_salt.bin"
 
 
 def _derive_key(passphrase: str, salt: bytes) -> bytes:

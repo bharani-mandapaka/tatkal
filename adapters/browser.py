@@ -75,8 +75,15 @@ class PlaywrightBrowser(BrowserPort):
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     async def login(self, username: str, password: str) -> bool:
-        await self.page.goto(IRCTC_HOME, wait_until="networkidle")
-        await asyncio.sleep(1)
+        # "networkidle" never fires on IRCTC (persistent WebSocket keep-alives).
+        # "load" waits for window.onload — reliable and fast.
+        await self.page.goto(IRCTC_HOME, wait_until="load")
+        await asyncio.sleep(2)   # React hydration
+
+        # If session cookies are still valid, skip the full login flow entirely
+        if await self.is_logged_in():
+            log.info("login_session_reused", username=username)
+            return True
 
         # Close any modal/popup if present
         try:
@@ -138,31 +145,41 @@ class PlaywrightBrowser(BrowserPort):
     # ── Navigation & form ─────────────────────────────────────────────────────
 
     async def navigate_to_booking(self) -> None:
-        await self.page.goto(IRCTC_HOME, wait_until="networkidle")
+        await self.page.goto(IRCTC_HOME, wait_until="load")
         await asyncio.sleep(0.5)
 
     async def prefill_search_form(self, config: BookingConfig) -> None:
-        async def fill_station(placeholder: str, code: str) -> None:
-            inp = self.page.locator(f"input[placeholder='{placeholder}']")
+        # Wait for Angular/PrimeNG to fully hydrate before touching anything
+        await self.page.wait_for_selector(
+            "p-autocomplete[formcontrolname='origin']", timeout=15_000
+        )
+
+        async def fill_station(formcontrol: str, code: str) -> None:
+            # PrimeNG autocomplete: the <input> sits inside
+            # <p-autocomplete formcontrolname="origin|destination">
+            inp = self.page.locator(
+                f"p-autocomplete[formcontrolname='{formcontrol}'] input"
+            )
             await inp.click()
             await inp.fill(code)
-            await asyncio.sleep(0.6)
-            suggestion = self.page.locator("li.ui-autocomplete-list-item, .ui-autocomplete-list-item").first
-            await suggestion.wait_for(timeout=6_000)
+            await asyncio.sleep(0.7)   # allow suggestion list to appear
+            suggestion = self.page.locator("li.ui-autocomplete-list-item").first
+            await suggestion.wait_for(timeout=8_000)
             await suggestion.click()
             await asyncio.sleep(0.3)
 
-        await fill_station("From", config.from_station)
-        await fill_station("To", config.to_station)
+        await fill_station("origin", config.from_station)
+        await fill_station("destination", config.to_station)
 
-        # Journey date — click calendar, type date
-        date_input = self.page.locator("input[placeholder='Date of Journey']")
-        await date_input.click()
-        await date_input.fill(config.journey_date)
+        # Journey date — PrimeNG calendar uses DD/MM/YYYY (not DD-MM-YYYY)
+        journey_date_fmt = config.journey_date.replace("-", "/")  # 27-05-2026 → 27/05/2026
+        date_input = self.page.locator("p-calendar[formcontrolname='journeyDate'] input")
+        await date_input.click(click_count=3)    # select all existing text
+        await date_input.fill(journey_date_fmt)
         await self.page.keyboard.press("Tab")
         await asyncio.sleep(0.3)
 
-        # Travel class dropdown
+        # Travel class dropdown (formcontrolname confirmed in DOM)
         class_dd = self.page.locator("p-dropdown[formcontrolname='journeyClass']")
         await class_dd.click()
         await self.page.locator(
@@ -170,16 +187,18 @@ class PlaywrightBrowser(BrowserPort):
         ).click()
         await asyncio.sleep(0.3)
 
-        # Quota — TATKAL
+        # Quota — configurable (TATKAL / GENERAL / PREMIUM TATKAL / etc.)
         quota_dd = self.page.locator("p-dropdown[formcontrolname='journeyQuota']")
         await quota_dd.click()
-        await self.page.locator("li.ui-dropdown-item:has-text('TATKAL')").click()
+        await self.page.locator(
+            f"li.ui-dropdown-item:has-text('{config.quota}')"
+        ).click()
         await asyncio.sleep(0.3)
 
         log.info("form_prefilled",
                  from_=config.from_station, to=config.to_station,
-                 date=config.journey_date, cls=config.travel_class.value,
-                 quota="TATKAL")
+                 date=journey_date_fmt, cls=config.travel_class.value,
+                 quota=config.quota)
 
     async def search_trains(self) -> None:
         await self.page.locator(
@@ -215,10 +234,8 @@ class PlaywrightBrowser(BrowserPort):
         log.info("train_found",
                  train=train_number, cls=travel_class, availability=avail_text)
 
-        # Show details and give user 5 s to abort
-        print(f"\n  Train {train_number} · {travel_class} · {avail_text}")
-        print("  Proceeding in 5 seconds... (Ctrl+C to abort)\n")
-        await asyncio.sleep(5)
+        # NO abort window here — every millisecond counts at the Tatkal window
+        print(f"  ✓ {train_number} · {travel_class} · {avail_text} — booking now")
 
         await class_cell.click()
         await asyncio.sleep(0.5)
@@ -240,55 +257,54 @@ class PlaywrightBrowser(BrowserPort):
             ".passenger-detail, app-passenger-info", timeout=15_000
         )
 
+        # ── Post-window phase: ZERO artificial delays ────────────────────────
+        # Every asyncio.sleep here is removed — Playwright awaits DOM events,
+        # not fixed timers. Use asyncio.sleep(0.05) ONLY if a React dropdown
+        # needs a tick to render its option list after being clicked.
         for i, pax in enumerate(config.passengers):
             n = i + 1  # 1-based index used in IRCTC IDs
 
             await self.page.fill(f"#passengerName{n}, input[id='name_{n}']", pax.name)
-            await asyncio.sleep(0.25)
-
             await self.page.fill(f"#passengerAge{n}, input[id='age_{n}']", str(pax.age))
-            await asyncio.sleep(0.2)
 
             # Gender dropdown
             gender_dd = self.page.locator(
                 f"p-dropdown[id='passengerGender{n}'], select[id='gender_{n}']"
             )
             await gender_dd.click()
+            await asyncio.sleep(0.05)   # React tick — dropdown renders options
             await self.page.locator(
                 f"li.ui-dropdown-item:has-text('{pax.gender.value}')"
             ).first.click()
-            await asyncio.sleep(0.2)
 
             # Berth preference dropdown
             berth_dd = self.page.locator(
                 f"p-dropdown[id='passengerBerthChoice{n}'], select[id='berth_{n}']"
             )
             await berth_dd.click()
+            await asyncio.sleep(0.05)
             await self.page.locator(
                 f"li.ui-dropdown-item:has-text('{pax.berth_preference.value}')"
             ).first.click()
-            await asyncio.sleep(0.2)
 
             # ID type (Tatkal mandatory)
             id_type_dd = self.page.locator(
                 f"p-dropdown[id='passengerIdType{n}'], select[id='idType_{n}']"
             )
             await id_type_dd.click()
+            await asyncio.sleep(0.05)
             await self.page.locator(
                 f"li.ui-dropdown-item:has-text('{pax.id_type.value}')"
             ).first.click()
-            await asyncio.sleep(0.2)
 
             await self.page.fill(
                 f"#passengerIdNumber{n}, input[id='idNumber_{n}']", pax.id_number
             )
-            await asyncio.sleep(0.2)
 
         # Mobile number
         mobile_inp = self.page.locator("#mobileNumber, input[formcontrolname='mobileNumber']")
         if await mobile_inp.count() > 0:
             await mobile_inp.fill(config.mobile)
-            await asyncio.sleep(0.2)
 
         # "Book only if confirmed" checkbox
         if config.book_only_if_confirmed:
@@ -297,7 +313,6 @@ class PlaywrightBrowser(BrowserPort):
             ).first
             if await cb.count() > 0 and not await cb.is_checked():
                 await cb.click()
-                await asyncio.sleep(0.2)
 
         log.info("passengers_filled", count=len(config.passengers))
 

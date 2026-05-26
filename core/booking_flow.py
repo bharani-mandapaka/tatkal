@@ -29,11 +29,13 @@ class BookingFlow:
         captcha: CaptchaPort,
         captcha_fallback: Optional[CaptchaPort],
         notifier: Notifier,
+        dry_run: bool = False,
     ):
         self.browser = browser
         self.captcha = captcha
         self.captcha_fallback = captcha_fallback
         self.notifier = notifier
+        self.dry_run = dry_run
         self.state = BookingState.IDLE
         self._window_start: Optional[datetime] = None
 
@@ -50,7 +52,7 @@ class BookingFlow:
                 "Tatkal Agent — FAILED",
                 f"Error at {self.state.name}: {e}",
             )
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✗ Booking failed: {e}")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] FAILED: {e}")
             print(f"  State at failure: {self.state.name}")
             print("  Nothing was booked. No payment was taken.\n")
             raise
@@ -102,6 +104,19 @@ class BookingFlow:
 
         # ── Payment ────────────────────────────────────────────────────────────
         self._transition(BookingState.PAYING)
+
+        if self.dry_run:
+            elapsed = _elapsed_ms(self._window_start) if self._window_start else 0
+            print()
+            print("  " + "-" * 53)
+            print("  [OK] DRY RUN COMPLETE -- payment page reached")
+            print(f"  Elapsed from window open: {_fmt_elapsed(elapsed)}")
+            print("  Browser is open -- inspect, then press Enter to close.")
+            print("  " + "-" * 53)
+            print()
+            input("  Press Enter to close the browser: ")
+            return {"dry_run": True, "reached": "payment_page", "elapsed_ms": elapsed}
+
         from payment import handle_payment
         await handle_payment(self.browser.page, config.payment, self.notifier)
 
