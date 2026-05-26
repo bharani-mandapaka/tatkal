@@ -1,0 +1,8 @@
+# Vercel serverless API dependencies (web configuration UI)
+# For the local booking agent, install requirements-agent.txt instead:
+#   pip install -r requirements-agent.txt
+#   playwright install chromium
+
+fastapi==0.111.0
+cryptography>=42.0.0
+python-multipart==0.0.9

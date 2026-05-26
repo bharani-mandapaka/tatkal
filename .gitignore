@@ -1,0 +1,10 @@
+booking_config.enc
+booking_salt.bin
+session.json
+confirmation_*.png
+booking_result_*.json
+session_*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
