@@ -348,3 +348,15 @@ class PlaywrightBrowser(BrowserPort):
     async def screenshot(self, path: str) -> None:
         await self.page.screenshot(path=path, full_page=True)
         log.info("screenshot_saved", path=path)
+
+    async def ping(self) -> None:
+        """
+        HEAD request on the current page URL — resets IRCTC's server-side
+        session idle timer without navigating or altering DOM state.
+        Errors are silently swallowed; the keepalive loop logs them.
+        """
+        await self.page.evaluate(
+            "() => fetch(window.location.href, "
+            "{method: 'HEAD', credentials: 'include', cache: 'no-store'})"
+            ".catch(() => {})"
+        )

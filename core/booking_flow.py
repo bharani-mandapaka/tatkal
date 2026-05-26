@@ -7,9 +7,12 @@ from core.state_machine import BookingState
 from ports.browser_port import BrowserPort
 from ports.captcha_port import CaptchaPort
 from adapters.notifier import Notifier
+from payment import handle_payment
 from logger import get_logger
 
 log = get_logger()
+
+_KEEPALIVE_INTERVAL_S = 15   # must be module-level so tests can import and patch it
 
 
 def _elapsed_ms(start: datetime) -> int:
@@ -71,9 +74,9 @@ class BookingFlow:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] Journey details pre-filled. "
               f"Waiting for {window_time.strftime('%H:%M:%S')}...")
 
-        # ── Wait for window ────────────────────────────────────────────────────
+        # ── Wait for window (with keepalive) ──────────────────────────────────
         self._transition(BookingState.WAITING_FOR_WINDOW)
-        await _countdown(window_time)
+        await self._wait_for_window(config, window_time)
         self._window_start = datetime.now()
 
         # ── Search ─────────────────────────────────────────────────────────────
@@ -89,6 +92,19 @@ class BookingFlow:
                  train=train_info.train_number,
                  avail=train_info.availability,
                  elapsed_ms=_elapsed_ms(self._window_start))
+
+        # ── Availability guard ─────────────────────────────────────────────────
+        # IRCTC flips availability between the search result and the booking page.
+        # If book_only_if_confirmed=True and the seat is now on Waitlist, abort
+        # cleanly rather than booking a WL ticket the user didn't want.
+        if config.book_only_if_confirmed:
+            avail_upper = train_info.availability.upper()
+            if avail_upper.startswith("WL") or "WAITLIST" in avail_upper:
+                raise RuntimeError(
+                    f"Train {train_info.train_number} availability flipped to Waitlist "
+                    f"({train_info.availability}) — book_only_if_confirmed=True, aborting. "
+                    "Disable book_only_if_confirmed to book WL tickets."
+                )
 
         # ── Fill passengers ────────────────────────────────────────────────────
         self._transition(BookingState.FILLING_PASSENGERS)
@@ -117,7 +133,6 @@ class BookingFlow:
             input("  Press Enter to close the browser: ")
             return {"dry_run": True, "reached": "payment_page", "elapsed_ms": elapsed}
 
-        from payment import handle_payment
         await handle_payment(self.browser.page, config.payment, self.notifier)
 
         # ── Confirmation ───────────────────────────────────────────────────────
@@ -140,6 +155,67 @@ class BookingFlow:
             "payment_method": config.payment.method.value if config.payment else "UNKNOWN",
             "screenshot": screenshot,
         }
+
+    async def _wait_for_window(self, config: BookingConfig, window_time: datetime) -> None:
+        """
+        Wait until the booking window opens while keeping the IRCTC session alive.
+
+        Two concurrent tasks:
+          - _countdown: precision async wait until window_time
+          - _keepalive: HEAD-pings IRCTC every 15 s to prevent server-side
+            session idle timeout (IRCTC's idle limit is ~30 min; 15 s is
+            intentionally aggressive so even a slow network doesn't miss it)
+
+        After the countdown completes (T=0) we do a mandatory session health
+        check because IRCTC force-logs out all users at exactly the Tatkal
+        window opening moment.  If the session was killed, we attempt a fast
+        re-login + re-fill before handing control to SEARCHING.
+        """
+        async def _keepalive() -> None:
+            while True:
+                await asyncio.sleep(_KEEPALIVE_INTERVAL_S)
+                try:
+                    await self.browser.ping()
+                    log.debug("session_keepalive_ok")
+                except Exception as exc:
+                    log.warning("session_keepalive_failed", error=str(exc))
+
+        keepalive_task = asyncio.create_task(_keepalive())
+        try:
+            await _countdown(window_time)
+        finally:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
+        # ── T=0: IRCTC force-logout check ─────────────────────────────────────
+        # IRCTC is known to invalidate all sessions at the exact moment the
+        # Tatkal window opens (10:00:00 for AC, 11:00:00 for non-AC).
+        # If that happened, attempt recovery before trying to search.
+        if not await self.browser.is_logged_in():
+            log.warning(
+                "session_force_expired_at_window",
+                action="relogin",
+                note="IRCTC kicks all users at window open — this is expected",
+            )
+            self.notifier.notify(
+                "Tatkal Agent — session expired",
+                "IRCTC kicked the session at window open. Attempting re-login.",
+            )
+            ok = await self.browser.login(config.username, config.password)
+            if not ok:
+                raise RuntimeError(
+                    "Session expired at window open and re-login failed. "
+                    "IRCTC CAPTCHA is likely required — booking aborted. "
+                    "Consider running with a 2captcha key so login CAPTCHAs "
+                    "are solved automatically."
+                )
+            # Re-navigate and re-fill the form (login navigated away from it)
+            await self.browser.navigate_to_booking()
+            await self.browser.prefill_search_form(config)
+            log.info("session_recovered", note="form_refilled_after_relogin")
 
     async def _solve_captcha(self) -> None:
         image_bytes = await self.browser.get_captcha_image()

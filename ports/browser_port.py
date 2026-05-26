@@ -55,3 +55,13 @@ class BrowserPort(ABC):
 
     @abstractmethod
     async def screenshot(self, path: str) -> None: ...
+
+    @abstractmethod
+    async def ping(self) -> None:
+        """
+        Lightweight server-side session keep-alive.
+        Must make an HTTP request that resets IRCTC's idle-timeout clock
+        without disrupting any visible page state.
+        Called every 15 s during the pre-window wait.
+        """
+        ...
