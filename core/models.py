@@ -90,6 +90,15 @@ class BookingConfig:
     book_only_if_confirmed: bool = True
     captcha_api_key: Optional[str] = None
 
+    # Admin HITL: WhatsApp number that receives CAPTCHA images and has 10s to reply.
+    # For personal use this is the same as the passenger's number.
+    # For a shared service this is the operator's number.
+    admin_phone: Optional[str] = None
+
+    # Hard timeout for the admin to solve CAPTCHA via WhatsApp.
+    # 2captcha (5–8s) is always attempted first; this is the fallback cutoff.
+    captcha_hitl_timeout_s: int = 10
+
     @property
     def is_ac_class(self) -> bool:
         return self.travel_class in (
