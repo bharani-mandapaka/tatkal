@@ -194,6 +194,15 @@ class BookingFlow:
         # IRCTC is known to invalidate all sessions at the exact moment the
         # Tatkal window opens (10:00:00 for AC, 11:00:00 for non-AC).
         # If that happened, attempt recovery before trying to search.
+        #
+        # Give Angular long enough to finish hydrating after the prefill.
+        # 1 s was too short when window_time == now() (dry-run instant-fire),
+        # producing a false 'session expired' reading and a wasteful second
+        # login.  Combined with is_logged_in()'s 6 s retry budget this gives
+        # ~9 s of total tolerance for Angular mid-render flicker.  In real
+        # Tatkal this adds at most 2 s of latency between window-open and
+        # search; in dry runs it removes ~11 s and a wasted second login.
+        await asyncio.sleep(3)
         if not await self.browser.is_logged_in():
             log.warning(
                 "session_force_expired_at_window",
@@ -218,7 +227,20 @@ class BookingFlow:
             log.info("session_recovered", note="form_refilled_after_relogin")
 
     async def _solve_captcha(self) -> None:
-        image_bytes = await self.browser.get_captcha_image()
+        # get_captcha_image() raises playwright.async_api.TimeoutError when
+        # the CAPTCHA element is absent.  On IRCTC's newer psgninput page
+        # (GENERAL quota) there is no CAPTCHA before the submit button — skip
+        # gracefully so the flow can continue to payment.
+        try:
+            image_bytes = await self.browser.get_captcha_image()
+        except Exception as e:
+            err_lower = str(e).lower()
+            if "timeout" in err_lower or "15000" in err_lower or "10000" in err_lower:
+                log.info("captcha_not_found_skipping",
+                         note="no CAPTCHA element on this page — proceeding")
+                return
+            raise
+
         try:
             log.info("captcha_solving", solver=type(self.captcha).__name__)
             text = await self.captcha.solve(image_bytes)

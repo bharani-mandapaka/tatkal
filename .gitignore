@@ -8,3 +8,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .env
+
+.vercel
+
+# Debug screenshots and scripts (generated during testing)
+step_*.png
+irctc_form*.png
+debug_train_selector.py
