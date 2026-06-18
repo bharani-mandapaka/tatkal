@@ -1,0 +1,15 @@
+# Normalize line endings: store as LF in the repo and check out as LF on all
+# platforms. This settles the "LF will be replaced by CRLF" warnings on Windows
+# (where core.autocrlf=true) and keeps diffs clean across machines.
+* text=auto eol=lf
+
+# Known binary types — never normalize these.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.gif  binary
+*.zip  binary
+*.enc  binary
+*.bin  binary
+*.pyc  binary
