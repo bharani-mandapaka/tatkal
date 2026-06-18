@@ -89,3 +89,230 @@ on psgninput hasn't been confirmed. Need to:
 - `plyer` balloon tip `ValueError: string too long (318, max 256)` — Windows notification truncation; cosmetic, doesn't affect booking
 - Hindi characters (हिंदी) in IRCTC header crash Windows console log encoder (charmap) — workaround: `errors='replace'` in diagnostic code
 - `inspect_dom.py`, `inspect_dom2.py` in repo — debug scripts, consider removing
+
+---
+
+## Stress-Test Findings 🧪 (pm-execution pass — 2026-06-18)
+
+All tasks below were surfaced by running the full pm-execution skill family against
+the as-built agent. Tag in `()` = skill that found it. Code refs are file:line.
+
+**Decision on record: NO-GO for any live Tatkal run** until the 🔴 items are closed
+and one real end-to-end PNR exists. Current build = flow-automation prototype.
+
+### 🔴 Launch-blocking (fatal — agent cannot win a real seat)
+
+- [ ] **Reality test first — gates everything else.** Do a manual TATKAL booking on
+  train 17644 at a real 10/11 AM window. Screenshot every screen between "Book Now"
+  and payment; stopwatch each segment. Confirms whether OTP/CAPTCHA/force-logout
+  appear and where the time actually goes. *(pre-mortem, red-team-prd, sprint-plan)*
+- [ ] **Aadhaar OTP is unhandled and mandatory** (since Jul 2025). Add
+  `AWAITING_AADHAAR_OTP` to `BookingState` + a human hand-off (reuse WhatsApp/terminal
+  gate). No OTP handling exists anywhere in `booking_flow.py` / `browser.py`.
+  *(strategy-red-team, create-prd, pre-mortem T1)*
+- [x] **Clock-skew check** — booking fires on local `datetime.now()` (`scheduler.py`),
+  not IRCTC server time. Add NTP-vs-local check to `main.py check`; abort if skew
+  >0.5s. *(red-team, prioritization ICE 384, pre-mortem T3)*
+  — **DONE 2026-06-18**: `get_ntp_offset()` in `scheduler.py` (stdlib SNTP, no dep);
+  `main.py check` warns + exits 1 if |skew|>0.5s, degrades gracefully if offline.
+- [ ] **Force-logout recovery dead-ends on login-CAPTCHA** — `booking_flow.py:281`
+  raises "booking aborted" when re-login needs a CAPTCHA (the most likely T=0 case).
+  Handle it (pre-warm 2captcha for login) + measure real recovery wall-time vs
+  time-to-soldout. *(red-team #3, pre-mortem T2)*
+
+### 🟠 High (verified bugs / zero coverage)
+
+- [x] **VERIFIED BUG: `AVAILABLE-0` → decision=book.** `evaluate_threshold`
+  (`availability_parser.py:100`) checks only `status_type`, never `confirmed_count`.
+  A zero-seat "AVAILABLE" badge triggers a booking attempt. Fix: require
+  `confirmed_count is None or confirmed_count >= passenger_count`. *(dummy-dataset)*
+  — **DONE 2026-06-18**: 0 seats → skip; confirmed < passengers → pause;
+  `passenger_count` threaded from `booking_flow.py`. Regression tests in
+  `tests/test_adversarial.py`.
+- [ ] **Payment has zero tests** — no test exercises UPI/Card/e-Wallet paths in
+  `payment.py`. *(test-scenarios S4/S6)*
+- [ ] **Auth/OTP has zero tests.** *(test-scenarios S1)*
+- [ ] **Double-book risk** — if payment succeeds but `get_booking_confirmation` poll
+  times out, run reports FAILED; operator re-runs → second booking. Add idempotency:
+  check "My Bookings" for today's PNR before re-submitting. *(pre-mortem T4)*
+- [ ] **No post-payment availability guard** — `book_only_if_confirmed` guards the
+  search→book flip (`booking_flow.py:112`) but nothing re-checks after payment starts;
+  money can be taken for a ticket that flipped to WL. *(user-stories B2, test-scenarios S6)*
+- [ ] **Carry-over: confirm `psgninput` submit button** — dry run still hasn't reached
+  payment even in GENERAL quota (was already "In Progress"; promoting — it blocks the
+  reality test). *(retro)*
+
+### 🟡 Medium (correctness / robustness)
+
+- [ ] **Silent name truncation** — names >15 chars chopped with no warning
+  (`models.py:56`); truncated name may not match Aadhaar/ID at boarding. Add visible
+  warning + ID-match note. *(user-stories D1, test-scenarios S7)*
+- [ ] **Berth dropdown re-render race** — dropdown shifts nth(3)→nth(2) after gender
+  select (CLAUDE.md); non-deterministic. Add post-select verification/retry.
+  *(test-scenarios S8)*
+- [ ] **Class-priority loop timing** — serial `read_availability_for_class` calls
+  (`booking_flow.py:185`) burn the window. Cap list to 2 or read in parallel.
+  *(red-team #2)*
+- [ ] **Verify `read_availability_for_class` reads the badge without the commit-click**
+  — CLAUDE.md says train-list needs 2 clicks to enable booking; the read-then-decide
+  architecture is invalid if reading requires committing. *(red-team #4)*
+- [ ] **Passenger input validation** — empty name, negative age, age >150, accented
+  chars, apostrophes all currently accepted (`models.py` Passenger). *(dummy-dataset)*
+- [ ] **Availability parser unknown statuses** — `CHART PREPARED`, `BOOKING CLOSED`,
+  concatenated badges, Hindi text fall through to UNKNOWN→skip (safe, but verify real
+  IRCTC strings). *(dummy-dataset)*
+- [x] **`clear_sensitive()` gaps** — zeroes CVV/MPIN but not `card_number`/`expiry`
+  (`models.py:69`); mutates shared in-memory config, relevant on re-run. *(user-stories C3)*
+  — **DONE 2026-06-18**: now also zeroes `card_number` + `card_expiry`; test extended.
+  (Shared-config mutation left as-is — clearing is the intended effect.)
+- [ ] **`admin_phone` shared-service mode** (`models.py:113`) — booking for others
+  escalates ToS risk; define consent/auth model or remove. *(stakeholder-map, create-prd)*
+
+### 🔵 Process / metrics (not code, but gating)
+
+- [ ] **Stop trusting GENERAL-quota dry runs** — they skip CAPTCHA/OTP/real payment
+  (`booking_flow.py:301` skips CAPTCHA on timeout). Mark any feature validated only in
+  GENERAL as "unproven". *(red-team-prd #1 — the most dangerous assumption)*
+- [ ] **Add win-rate instrumentation** — `booking_result.json` logs `booking_time_ms`
+  (speed) but not the North Star: confirmed-seat win-rate + unintended-booking count.
+  *(brainstorm-okrs)*
+- [ ] **Freeze performance work** until first real end-to-end PNR exists. *(retro)*
+- [ ] **Re-validate IRCTC rule changes** before each live run (5-min check). *(retro)*
+- [ ] **Strategic decision pending:** if reality test shows OTP can't be cleared within
+  the seat-window, pivot from "autonomous booker" to "fast human-assist" — WhatsApp
+  layer becomes primary product. *(outcome-roadmap, summarize-meeting)*
+
+### 🧰 Test-infra follow-ups
+
+- [x] Turn `tests/fixtures_adversarial.py` into a runnable parametrized pytest against
+  `parse_availability` / `evaluate_threshold` / `Passenger`. *(dummy-dataset)*
+  — **DONE 2026-06-18**: `tests/test_adversarial.py`; passenger-validation gaps
+  encoded as `xfail` so they're tracked without breaking the suite.
+
+---
+
+## Competitive Analysis Findings 🥊 (2026-06-18)
+
+Benchmarked against commercial tools (Tatkal Panda, Nexus, Ocean/TSF) and OSS
+(shivamguys/cypress, lucky12651 Google-Vision, nashit8421 undetected-chromedriver).
+Maturity verdict: **best-architected agent found, but ~Stage 0.7 of 4 operationally**
+(zero confirmed PNRs; competitors have thousands). Strategic position: **win as a
+"fast human-assist booker," not an autonomous bot** — lean into availability
+intelligence + WhatsApp HITL where we already lead; avoid the anti-ban arms race.
+
+### 🟩 Differentiators to lean into (where we already beat the field)
+- [ ] **WhatsApp fast-assist as the PRIMARY product** — make CAPTCHA + OTP + payment
+  hand-off the headline feature, not a fallback. No competitor pairs this with
+  availability logic.
+- [ ] **Harden the availability-decision engine** — it's our biggest edge; most tools
+  blindly book whatever's clicked. (Depends on the `AVAILABLE-0` fix above.)
+
+### 🟦 Table-stakes to borrow from competitors
+- [ ] **Mobile OTP auto-read** — Android SMS-retriever / ADB bridge to grab the
+  Aadhaar OTP and autofill it. Closes the Tier-0 OTP gap with near-zero human latency;
+  this is THE technique mature mobile tools use. *(competitor: commercial mobile apps)*
+- [ ] **OCR-first CAPTCHA (confidence-gated, race against 2captcha)** — flip current
+  order: local OCR primary (~0.3s, free), 2captcha fallback, human last. Best as a
+  parallel race using whichever returns first with high confidence.
+  **Prereq experiment:** test OCR accuracy on ~20 real IRCTC captchas; only adopt if
+  ≥~85% confidence-gated accuracy, else keep 2captcha primary. New adapter
+  `adapters/captcha_ocr.py` implementing `CaptchaPort`. *(competitor: lucky12651 Google Vision)*
+- [ ] **Light anti-detection** — add `playwright-stealth` so we don't look obviously
+  scripted. Do NOT enter the fingerprint arms race (unwinnable for a solo project;
+  IRCTC blocked 2.4cr IDs in 6 months with AI). *(competitor: undetected-chromedriver)*
+
+### ⬛ Explicitly NOT building (de-scope decisions)
+- [ ] Autonomous zero-human booking — killed by the Aadhaar OTP mandate.
+- [ ] Fingerprint/anti-ban as a core feature — unwinnable treadmill.
+- [ ] `admin_phone` shared-service mode — highest ToS/legal risk; cut it (also listed 🟡).
+- [ ] Millisecond form-fill micro-optimization — human OTP latency dwarfs it.
+
+---
+
+## 🎯 Fix-First Order (recommended sequence)
+
+The single question "what first?" — answered. Do these in order; each gates the next.
+
+1. **Reality test** (manual TATKAL on 17644, screenshots + stopwatch). *Why first:
+   it's free, takes 20 min, and can invalidate items 4–5 before you build them.*
+2. **`AVAILABLE-0` + `confirmed_count ≥ passengers` fix.** *Why: verified bug,
+   one-line-ish, fixture already written, prevents booking a sold-out class.*
+3. **Clock-skew guard in `main.py check`.** *Why: cheap, high-confidence (ICE 384),
+   independent of everything; a late fire loses the seat regardless of other fixes.*
+4. **Aadhaar OTP hand-off** (`AWAITING_AADHAAR_OTP` + terminal entry first, mobile
+   auto-read later). *Why: THE existential blocker — without it a live run stalls.
+   Scope it from what the reality test reveals.*
+5. **Force-logout recovery that handles login-CAPTCHA.** *Why: most-likely T=0 failure;
+   pairs with #4 (both are "auth at the window").*
+6. **Payment idempotency + post-payment guard.** *Why: prevents the two
+   irreversible-harm outcomes (double-charge, WL charge) once you're booking for real.*
+
+Everything else (🟡 robustness, OCR-first, anti-ban, WhatsApp-primary) comes AFTER a
+first confirmed PNR. Correctness before speed; reality before polish.
+
+---
+
+## Full-Stack Stress Test Findings 🏗️ (2026-06-18)
+
+Audited every layer: crypto/data, web frontend, web backend, browser automation,
+WhatsApp HITL. Crypto **verified correct** (round-trip + wrong-pass rejection).
+Biggest new exposure is where **real user secrets meet disk and network**.
+File refs are file:line. None block a *personal* run today, but they matter most
+if this ever touches another person's data.
+
+### 🟠 Security / data-handling (the highest-value new findings)
+- [ ] **Plaintext credentials transit the Vercel server.** The web form POSTs IRCTC
+  password + full card (number/expiry/CVV) + MPIN as JSON; encryption is **server-side**
+  (`api/index.py:82`), so plaintext lives in the serverless function's memory. The
+  "never logged on this server" banner is unverifiable. **Fix: encrypt client-side
+  (Web Crypto API) so plaintext never leaves the browser.** *(api/index.py:466)*
+- [ ] **CVV stored at rest** (encrypted, but stored). PCI-DSS prohibits storing CVV at
+  all. Fix: collect CVV at run-time, or drop card support. *(collector.py:112, models.py:66)*
+- [ ] **Sensitive screenshots written to disk unencrypted** — `step_pax_form.png` etc.
+  capture passenger names, ages, **ID numbers** in plaintext on every run. Gate behind a
+  `DEBUG` flag; scrub or encrypt. *(browser.py:815 + ~12 more call sites)*
+- [ ] **No passphrase-strength enforcement** (collector + web form). A weak passphrase
+  collapses the whole encryption — this is the real attack surface, not the cipher.
+- [ ] **`session.json` cookies stored plaintext** in cwd — leaked file = IRCTC session
+  hijack. Confirm `.gitignore` covers it; consider encrypting. *(browser.py:23)*
+- [ ] **No log scrubber** (plan claimed one). `username` + header snippets (PII) logged.
+  *(browser.py:183, browser.py:263)*
+
+### 🟠 WhatsApp HITL — dangling component (docs overstate it)
+- [ ] **Not wired end-to-end.** `deliver_reply` is called only by tests; there is **no
+  webhook endpoint** in `api/index.py` (only `/`, `/health`, `/api/configure`) and **no
+  `send_image_fn` implementation**. Gate + adapter are unit-tested islands. CLAUDE.md's
+  "api/index.py = Vercel FastAPI webhook" is **inaccurate — fix the doc**. *(reply_gate.py)*
+- [ ] **No Meta signature verification** (`X-Hub-Signature-256`) — must exist before any
+  inbound webhook goes live, or anyone can POST a fake CAPTCHA/OTP reply.
+- [ ] **Global-dict gate** (`_gates`/`_replies`) is single-process/single-booking;
+  phone-key collision under concurrency. Fine personal, breaks as a service. *(reply_gate.py:21)*
+- [ ] **10s hardcoded HITL timeout** is OK for CAPTCHA but **far too short for an SMS OTP**
+  (the thing it must eventually handle). *(captcha_admin_hitl.py:29)*
+
+### 🟡 Automation robustness (`browser.py`)
+- [ ] **`force=True` on Book Now bypasses the `disable-book` guard** — can click a
+  genuinely-disabled (not-bookable) button → undefined downstream state. *(browser.py:740)*
+- [ ] **`train_number in page.content()`** substring match → false-positive risk (number
+  could match a price/time/other train). Scope the check to train-card elements. *(browser.py:408)*
+- [ ] **Entirely selector-dependent** ("as of mid-2025"); no selector-drift detection —
+  the #1 ongoing breakage risk. Consider a pre-run selector smoke-check. *(browser.py:4)*
+
+### 🟡 Web backend (`/api/configure`)
+- [ ] **Zero server-side validation** — accepts any JSON shape; no field types,
+  passenger-count cap, or age/string sanity. Malformed input flows into the encrypted
+  config and breaks later at `_build_config`. *(api/index.py:66)*
+- [ ] **No rate limiting / body-size limit** — DoS-able (low impact; stateless). *(api/index.py:55)*
+
+### 🔵 Hygiene / consistency
+- [ ] Docstring references `tests/test_integration.py` which **doesn't exist**. *(browser.py:6)*
+- [ ] **Two countdown implementations** (`scheduler.wait_until` + `booking_flow._countdown`)
+  — duplication/drift risk; consolidate.
+- [ ] Agent deps loosely pinned (`>=`), no lockfile → supply-chain drift. *(requirements-agent.txt)*
+
+### ✅ Verified solid (do not regress)
+- Crypto: PBKDF2-SHA256 480k + Fernet, random salt/save — round-trip + wrong-pass
+  rejection **verified in-memory**. *(config.py:17)*
+- Login false-positive re-check (`browser.py:146`) and no-hard-reload session guard
+  (`browser.py:296`) — genuinely smart IRCTC-specific defenses.
+- Hexagonal ports make the whole stack mock-testable. 109 tests pass, 3 xfail.

@@ -87,7 +87,7 @@ Then handle the station-mismatch Confirmation dialog (click "Yes").
 
 `booking_config.enc` + `booking_salt.bin` — never commit these.
 Passphrase: stored in user's head only.
-For dry runs, `run_auto.py` hardcodes `PASSPHRASE = "17644MAS"`.
+For dry runs, `run_auto.py` reads `PASSPHRASE` from `TATKAL_DEV_PASSPHRASE` env var (see `.env.example`).
 
 ## Booking thresholds (planned)
 
