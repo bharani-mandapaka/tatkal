@@ -57,12 +57,16 @@ def test_non_ac_classes_detected():
 def test_payment_clear_sensitive_zeroes_fields():
     pc = PaymentConfig(
         method=PaymentMethod.CARD,
+        card_number="4111111111111111",
+        card_expiry="12/29",
         card_cvv="123",
         wallet_mpin="4321",
     )
     pc.clear_sensitive()
     assert pc.card_cvv == ""
     assert pc.wallet_mpin == ""
+    assert pc.card_number == ""
+    assert pc.card_expiry == ""
 
 
 def test_payment_clear_sensitive_upi_is_noop():

@@ -42,6 +42,7 @@ def _auto_input(prompt=""):
 builtins.input = _auto_input
 
 # ── Normal imports (after patch) ──────────────────────────────────────────────
+import os
 sys.path.insert(0, ".")
 
 from logger import setup_logging, get_logger
@@ -52,8 +53,12 @@ from adapters.notifier import Notifier
 from core.booking_flow import BookingFlow
 from main import _build_config
 
-PASSPHRASE = "17644MAS"
+PASSPHRASE = os.environ.get("TATKAL_DEV_PASSPHRASE", "")
 DRY_RUN    = True
+
+if not PASSPHRASE:
+    print("ERROR: Set TATKAL_DEV_PASSPHRASE env var before running (see .env.example)")
+    sys.exit(1)
 
 _HERE = Path(__file__).resolve().parent
 

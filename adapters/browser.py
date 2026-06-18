@@ -481,6 +481,56 @@ class PlaywrightBrowser(BrowserPort):
             availability=avail_text,
         )
 
+    async def read_availability_for_class(
+        self, train_number: str, travel_class: str
+    ) -> str:
+        """Read the live availability badge for train_number / travel_class from
+        the search results page WITHOUT clicking Book Now.
+
+        Returns the raw badge text, e.g. "AVAILABLE-4", "GNWL 45/WL 30",
+        "REGRET", "NOT AVAILABLE", or "UNKNOWN" if the badge can't be found.
+        """
+        await self.page.wait_for_selector(
+            "[class*='train'], app-train-avl-enq", timeout=30_000
+        )
+
+        badge_text: str = await self.page.evaluate("""(args) => {
+            var tn = args[0], tc = args[1];
+            // Find the train card
+            var cards = document.querySelectorAll('app-train-avl-enq');
+            var card = Array.from(cards).find(function(c) {
+                return c.textContent.includes(tn);
+            });
+            if (!card) return 'NOT_FOUND';
+            // Find the class tab that matches travel_class (e.g. "(SL)")
+            var all = Array.from(card.querySelectorAll('*'));
+            var clsEl = all.find(function(el) {
+                return el.textContent.trim().includes('(' + tc + ')');
+            });
+            if (!clsEl) return 'CLASS_NOT_FOUND';
+            // Look for availability badge siblings — text matching AVAILABLE, WL, RAC etc.
+            var parent = clsEl.closest('li, .class-avl-enq, [class*="avl"], td') || clsEl.parentElement;
+            var avlPat = /AVAILABLE|CURR_AVBL|RAC|GNWL|RLWL|PQWL|TQWL|RSWL|WL|REGRET|NOT AVAILABLE|TRAIN CANCEL/i;
+            // Walk up to find the section containing availability text
+            var search = parent;
+            for (var i = 0; i < 5 && search; i++) {
+                var desc = Array.from(search.querySelectorAll('*'));
+                var hit = desc.find(function(el) {
+                    return avlPat.test(el.textContent.trim()) &&
+                           el.textContent.trim().length < 50 &&
+                           el.children.length === 0;  // leaf node
+                });
+                if (hit) return hit.textContent.trim();
+                search = search.parentElement;
+            }
+            // Fallback: return raw text from the card's availability area
+            return (card.textContent.match(avlPat) || ['UNKNOWN'])[0];
+        }""", [train_number, travel_class])
+
+        log.info("read_availability", train=train_number, cls=travel_class,
+                 badge=badge_text)
+        return badge_text or "UNKNOWN"
+
     # ── Intermediate booking/train-list page ─────────────────────────────────
 
     async def _proceed_from_booking_train_list(self, config: BookingConfig) -> None:
@@ -1090,11 +1140,17 @@ class PlaywrightBrowser(BrowserPort):
                 except Exception:
                     pass
             if not berth_filled:
-                # psgninput: idx=3 = passengerBerthChoice (stable from DOM dump)
+                # psgninput: berth starts at idx=3 but Angular re-renders after
+                # gender fill and removes the nationality dropdown, shifting berth
+                # to idx=2.  Try both before falling back to content detection.
                 if "psgninput" in self.page.url:
-                    berth_filled = await _open_dd_and_pick(
-                        3, pax.berth_preference.value, berth_display, "berth"
-                    )
+                    for berth_idx in (3, 2):
+                        berth_filled = await _open_dd_and_pick(
+                            berth_idx, pax.berth_preference.value,
+                            berth_display, "berth"
+                        )
+                        if berth_filled:
+                            break
                 if not berth_filled:
                     berth_filled = await _click_dd_by_content(
                         ["Lower", "Upper", "No Preference"],

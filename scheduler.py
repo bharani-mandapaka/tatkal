@@ -1,7 +1,39 @@
 import asyncio
+import socket
+import struct
 from datetime import datetime, timedelta
 
 from core.models import BookingConfig
+
+# Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+_NTP_UNIX_DELTA = 2208988800
+
+
+def get_ntp_offset(server: str = "pool.ntp.org", timeout: float = 3.0) -> float:
+    """
+    Return (true time − local clock) in seconds via a minimal SNTP query.
+
+    Positive  → the local clock is BEHIND real time (booking would fire late).
+    Negative  → the local clock is AHEAD of real time (booking would fire early).
+
+    Dependency-free (stdlib socket/struct). Raises OSError on network failure
+    or timeout — callers should treat that as "skew unknown", not "skew zero".
+    """
+    # SNTP client request: leap=0, version=3, mode=3 → first byte 0x1B, rest zero.
+    packet = b"\x1b" + 47 * b"\x00"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(timeout)
+        s.sendto(packet, (server, 123))
+        t0 = datetime.now().timestamp()
+        data, _ = s.recvfrom(48)
+        t1 = datetime.now().timestamp()
+
+    # Transmit timestamp = bytes 40..48: 32-bit seconds + 32-bit fraction.
+    secs, frac = struct.unpack("!II", data[40:48])
+    server_time = (secs - _NTP_UNIX_DELTA) + frac / 2 ** 32
+    # Approximate local time at the instant the server stamped its reply.
+    local_at_reply = (t0 + t1) / 2
+    return server_time - local_at_reply
 
 
 def calculate_booking_times(config: BookingConfig) -> tuple[datetime, datetime]:

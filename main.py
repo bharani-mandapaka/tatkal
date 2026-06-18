@@ -29,10 +29,11 @@ def cmd_collect() -> None:
 def cmd_check() -> None:
     import questionary
     from config import config_exists, load_config
-    from scheduler import calculate_booking_times
+    from scheduler import calculate_booking_times, get_ntp_offset
 
     print("\nTatkal Agent — Pre-run Check")
     print("─" * 35)
+    problems: list[str] = []
 
     if not config_exists():
         print("Config file         ✗ NOT FOUND — run: python main.py collect")
@@ -62,6 +63,22 @@ def cmd_check() -> None:
     else:
         print("2captcha key        — Not set (manual CAPTCHA mode)")
 
+    # Clock-skew check — the agent fires on the local clock, so a wrong clock
+    # fires the booking at the wrong second. >0.5s skew can lose the seat.
+    try:
+        offset = get_ntp_offset()
+        if abs(offset) <= 0.5:
+            print(f"Clock sync          ✓ Within {offset:+.2f}s of true time")
+        else:
+            print(f"Clock sync          ✗ Off by {offset:+.2f}s vs true time")
+            problems.append(
+                f"Clock is off by {offset:+.2f}s. The agent fires on local time — "
+                ">0.5s skew can lose the seat.\n"
+                "  Fix: enable automatic date/time sync in your OS settings, then re-run check."
+            )
+    except OSError:
+        print("Clock sync          — Could not reach NTP server (offline?); skew not checked")
+
     config = _build_config(raw)
     login_time, window_time = calculate_booking_times(config)
     remaining = window_time - datetime.now()
@@ -71,6 +88,13 @@ def cmd_check() -> None:
     print(f"Booking window      {window_time.strftime('%H:%M:%S')} · {window_time.strftime('%d %b %Y')}")
     print(f"Login fires at      {login_time.strftime('%H:%M:%S')}")
     print(f"Time until login    {hours}h {mins:02d}m")
+
+    if problems:
+        print("\n✗ Check found problems:")
+        for p in problems:
+            print(f"  • {p}")
+        sys.exit(1)
+
     print("\nAll checks passed.")
     print("Run 'python main.py run' and keep this terminal open.\n")
 

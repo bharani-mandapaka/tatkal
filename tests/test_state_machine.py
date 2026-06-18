@@ -5,8 +5,10 @@ def test_all_states_present():
     names = [s.name for s in BookingState]
     expected = [
         "IDLE", "LOGGING_IN", "PREFILLING_FORM", "WAITING_FOR_WINDOW",
-        "SEARCHING", "SELECTING_TRAIN", "FILLING_PASSENGERS",
-        "SOLVING_CAPTCHA", "SUBMITTING", "PAYING", "CONFIRMED", "FAILED",
+        "SEARCHING", "READING_AVAILABILITY", "AWAITING_USER_APPROVAL",
+        "TRYING_NEXT_CLASS", "SELECTING_TRAIN", "FILLING_PASSENGERS",
+        "SOLVING_CAPTCHA", "SUBMITTING", "PAYING", "CONFIRMED",
+        "REPORTING_FAILURE", "FAILED",
     ]
     assert names == expected
 

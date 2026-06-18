@@ -67,11 +67,27 @@ class PaymentConfig:
     card_cvv: Optional[str] = None
 
     def clear_sensitive(self):
-        """Zero sensitive fields after payment attempt."""
+        """Zero all sensitive payment fields after a payment attempt."""
         if self.wallet_mpin:
             self.wallet_mpin = ""
         if self.card_cvv:
             self.card_cvv = ""
+        if self.card_number:
+            self.card_number = ""
+        if self.card_expiry:
+            self.card_expiry = ""
+
+
+@dataclass
+class BookingThresholds:
+    """
+    Controls which availability statuses the agent will book without user input.
+    Defaults: only confirmed (AVAILABLE / CURR_AVBL) — no RAC, no WL.
+    """
+    max_rac: int | None = None              # None = never book RAC
+    max_wl: int | None = None               # None = never book WL
+    borderline_buffer: int = 2              # pause for user Y/N if within this many of limit
+    allowed_wl_types: list = field(default_factory=list)  # e.g. ["GNWL", "RLWL"]
 
 
 @dataclass
@@ -90,6 +106,10 @@ class BookingConfig:
     book_only_if_confirmed: bool = True
     captcha_api_key: Optional[str] = None
     quota: str = "TATKAL"  # "TATKAL", "PREMIUM TATKAL", "GENERAL", "LADIES", etc.
+
+    # 5-stage workflow fields
+    class_priority: list = field(default_factory=list)      # e.g. ["SL", "3A", "2A"]
+    thresholds: BookingThresholds = field(default_factory=BookingThresholds)
 
     # Admin HITL: WhatsApp number that receives CAPTCHA images and has 10s to reply.
     # For personal use this is the same as the passenger's number.

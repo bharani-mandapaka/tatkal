@@ -39,6 +39,9 @@ class BrowserPort(ABC):
     async def find_and_select_train(self, train_number: str, travel_class: str) -> TrainInfo: ...
 
     @abstractmethod
+    async def read_availability_for_class(self, train_number: str, travel_class: str) -> str: ...
+
+    @abstractmethod
     async def fill_passenger_details(self, config: BookingConfig) -> None: ...
 
     @abstractmethod

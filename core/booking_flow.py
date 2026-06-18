@@ -2,8 +2,9 @@ import asyncio
 from datetime import datetime
 from typing import Optional
 
-from core.models import BookingConfig
+from core.models import BookingConfig, TravelClass
 from core.state_machine import BookingState
+from core.availability_parser import parse_availability, evaluate_threshold
 from ports.browser_port import BrowserPort
 from ports.captcha_port import CaptchaPort
 from adapters.notifier import Notifier
@@ -83,10 +84,21 @@ class BookingFlow:
         self._transition(BookingState.SEARCHING)
         await self.browser.search_trains()
 
+        # ── Read live availability + decide which class to book ────────────────
+        # Uses class_priority list when set (new 5-stage flow).
+        # Falls back to config.travel_class for old-style single-class configs.
+        chosen_class = config.travel_class.value
+        if config.class_priority:
+            chosen_class, _ = await self._check_availability_and_decide(config)
+            try:
+                config.travel_class = TravelClass(chosen_class)
+            except ValueError:
+                pass  # non-standard class code — keep as string for downstream
+
         # ── Select train ───────────────────────────────────────────────────────
         self._transition(BookingState.SELECTING_TRAIN)
         train_info = await self.browser.find_and_select_train(
-            config.train_number, config.travel_class.value
+            config.train_number, chosen_class
         )
         log.info("train_selected",
                  train=train_info.train_number,
@@ -155,6 +167,59 @@ class BookingFlow:
             "payment_method": config.payment.method.value if config.payment else "UNKNOWN",
             "screenshot": screenshot,
         }
+
+    async def _check_availability_and_decide(
+        self, config: BookingConfig
+    ) -> tuple[str, str]:
+        """
+        Stage 4: iterate class_priority list, read live availability for each,
+        evaluate against BookingThresholds, and return (class_value, "book").
+
+        Raises RuntimeError (with Stage 5B table printed) if no class passes.
+        """
+        failure_rows: list[tuple[str, str, str]] = []
+
+        print(f"\n  {'Class':<6}  {'Availability':<30}  Decision")
+        print("  " + "-" * 55)
+
+        for cls in config.class_priority:
+            self._transition(BookingState.READING_AVAILABILITY, cls=cls)
+            raw = await self.browser.read_availability_for_class(
+                config.train_number, cls
+            )
+            result = parse_availability(raw)
+            decision = evaluate_threshold(
+                result, config.thresholds, passenger_count=len(config.passengers)
+            )
+
+            print(f"  {cls:<6}  {raw:<30}  → {decision}")
+
+            if decision == "book":
+                print()
+                return cls, decision
+
+            if decision == "pause":
+                self._transition(BookingState.AWAITING_USER_APPROVAL,
+                                 cls=cls, status=raw)
+                print(f"\n  Status {raw} is within your threshold buffer.")
+                answer = input(f"  Book {cls} at {raw}? (y/N): ").strip().lower()
+                if answer in ("y", "yes"):
+                    print()
+                    return cls, "book"
+                failure_rows.append((cls, raw, "skipped by user"))
+            else:
+                failure_rows.append((cls, raw, "below threshold / not bookable"))
+
+            if len(config.class_priority) > 1:
+                self._transition(BookingState.TRYING_NEXT_CLASS, cls=cls)
+
+        # No class passed — print failure table and raise
+        self._transition(BookingState.REPORTING_FAILURE)
+        _print_failure_table(failure_rows)
+        raise RuntimeError(
+            f"No bookable seat found across {len(config.class_priority)} class(es). "
+            "See availability table above. Nothing was charged."
+        )
 
     async def _wait_for_window(self, config: BookingConfig, window_time: datetime) -> None:
         """
@@ -271,6 +336,18 @@ async def _countdown(target: datetime) -> None:
             await asyncio.sleep(0.1)
         else:
             await asyncio.sleep(min(remaining - 5, 30))
+
+
+def _print_failure_table(rows: list[tuple[str, str, str]]) -> None:
+    now = datetime.now().strftime("%H:%M:%S")
+    print(f"\n[{now}] No booking made.\n")
+    print(f"  {'Class':<6}  {'Status':<30}  Decision")
+    print("  " + "-" * 60)
+    for cls, status, reason in rows:
+        print(f"  {cls:<6}  {status:<30}  {reason}")
+    print()
+    print("  Result: No booking made. Nothing was charged.")
+    print()
 
 
 def _print_success(pnr: str, config: BookingConfig, elapsed_ms: int, screenshot: str) -> None:
