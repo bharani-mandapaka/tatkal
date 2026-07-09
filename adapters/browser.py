@@ -1,10 +1,10 @@
 """
 Playwright implementation of BrowserPort.
 
-IRCTC is a React SPA — selectors here reflect the site as of mid-2025.
+IRCTC is an Angular SPA — selectors here reflect the site as of mid-2025.
 If IRCTC updates their DOM, adjust the selectors in each method below.
-Run integration tests (tests/test_integration.py) against General quota
-off-peak to verify before a live Tatkal run.
+Verify off-peak in GENERAL quota with `python run_auto.py` (dry run, stops at
+the payment page) before any live Tatkal run.
 """
 import asyncio
 import json
@@ -72,6 +72,39 @@ class PlaywrightBrowser(BrowserPort):
             await self._playwright.stop()
         log.info("browser_closed")
 
+    async def _dismiss_welcome_modal(self) -> None:
+        """
+        On a fresh session IRCTC shows a Welcome modal combining a Tatkal/Aadhaar
+        alert ("Authenticate now") with a language choice (हिंदी / English).
+        Click 'English' to proceed — NEVER 'Authenticate now' (that starts the
+        Aadhaar flow). Falls back to a generic close button. Safe no-op if absent.
+        """
+        try:
+            english = self.page.locator(
+                "button:has-text('English'), a:has-text('English'), "
+                ".btn:has-text('English'), [class*='lang']:has-text('English')"
+            ).first
+            if await english.count() > 0 and await english.is_visible(timeout=2_000):
+                await english.click()
+                log.info("welcome_modal_english_selected")
+                await asyncio.sleep(0.5)
+                return
+        except Exception as e:
+            log.debug("welcome_modal_english_skip", note=str(e)[:60])
+
+        # Generic close fallback for any promo/alert modal still showing.
+        try:
+            close_btn = self.page.locator(
+                ".modal-close, button.close, .ui-dialog-titlebar-close, "
+                "button[aria-label='Close']"
+            ).first
+            if await close_btn.count() > 0 and await close_btn.is_visible():
+                await close_btn.click()
+                log.info("welcome_modal_closed_generic")
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
     # ── Auth ──────────────────────────────────────────────────────────────────
 
     async def login(self, username: str, password: str) -> bool:
@@ -79,6 +112,10 @@ class PlaywrightBrowser(BrowserPort):
         # "load" waits for window.onload — reliable and fast.
         await self.page.goto(IRCTC_HOME, wait_until="load")
         await asyncio.sleep(2)   # React hydration
+
+        # Fresh sessions show a Welcome modal (Aadhaar alert + language choice).
+        # Pick English and dismiss it before anything else.
+        await self._dismiss_welcome_modal()
 
         # If session cookies are still valid, skip the full login flow entirely
         if await self.is_logged_in():
@@ -337,14 +374,18 @@ class PlaywrightBrowser(BrowserPort):
         # We must fire real key events: click to focus+open calendar, Ctrl+A to
         # select all, then type() each character so Angular sees keydown/input events.
         journey_date_fmt = config.journey_date.replace("-", "/")  # 27-05-2026 → 27/05/2026
-        date_input = self.page.locator("p-calendar[formcontrolname='journeyDate'] input")
-        await date_input.click()
-        await asyncio.sleep(0.3)
-        await date_input.press("Control+a")
-        await self.page.keyboard.type(journey_date_fmt, delay=80)
-        await asyncio.sleep(0.5)
-        await self.page.keyboard.press("Tab")    # commit + close calendar popup
-        await asyncio.sleep(0.5)
+
+        async def fill_date() -> None:
+            date_input = self.page.locator("p-calendar[formcontrolname='journeyDate'] input")
+            await date_input.click()
+            await asyncio.sleep(0.3)
+            await date_input.press("Control+a")
+            await self.page.keyboard.type(journey_date_fmt, delay=80)
+            await asyncio.sleep(0.5)
+            await self.page.keyboard.press("Tab")    # commit + close calendar popup
+            await asyncio.sleep(0.5)
+
+        await fill_date()
 
         # Travel class dropdown (formcontrolname confirmed in DOM)
         class_dd = self.page.locator("p-dropdown[formcontrolname='journeyClass']")
@@ -362,25 +403,110 @@ class PlaywrightBrowser(BrowserPort):
         ).click()
         await asyncio.sleep(0.3)
 
+        # ── Verify the form actually committed (anti-flake) ──────────────────
+        # IRCTC's "Search Trains" only navigates if Angular's reactive form is
+        # valid. Filling the DOM doesn't guarantee the model updated — there's a
+        # race between fill() and Angular change detection. Read each field back
+        # and re-fill any that didn't stick. This was the root cause of search
+        # intermittently no-op'ing (page stayed on /train-search).
+        for _ in range(2):
+            rb = await self.page.evaluate("""() => {
+                const v = sel => { const e = document.querySelector(sel);
+                    return e ? (e.value || '').trim() : ''; };
+                return {
+                    origin: v("p-autocomplete[formcontrolname='origin'] input"),
+                    dest:   v("p-autocomplete[formcontrolname='destination'] input"),
+                    date:   v("p-calendar[formcontrolname='journeyDate'] input"),
+                };
+            }""")
+            missing = [k for k in ("origin", "dest", "date") if not rb.get(k)]
+            if not missing:
+                break
+            log.warning("prefill_incomplete_refilling", missing=str(missing))
+            if "origin" in missing:
+                await fill_station("origin", config.from_station)
+            if "dest" in missing:
+                await fill_station("destination", config.to_station)
+            if "date" in missing:
+                await fill_date()
+
         log.info("form_prefilled",
                  from_=config.from_station, to=config.to_station,
                  date=journey_date_fmt, cls=config.travel_class.value,
                  quota=config.quota)
 
     async def search_trains(self) -> None:
-        await self.page.locator(
-            "button:has-text('Search'), button.search_btn"
-        ).first.click()
-        # Wait for the Angular shell to attach to the DOM (state="attached" avoids
-        # the false-negative that state="visible" triggers because the Angular
-        # host element has 0 height until results hydrate).  Then wait an extra
-        # 3 s for the train rows to fully render before find_and_select_train
-        # tries to locate .train-heading.
-        await self.page.wait_for_selector(
-            "app-train-avl-enq", timeout=60_000, state="attached"
-        )
-        await asyncio.sleep(3)
-        log.info("train_list_loaded")
+        # DIAG: confirm the form actually registered values, and inspect the
+        # Search button(s) before clicking. Pins "form invalid" vs "wrong button".
+        try:
+            pre = await self.page.evaluate("""() => {
+                const v = sel => { const e = document.querySelector(sel);
+                    return e ? (e.value || e.textContent || '').trim()
+                        .replace(/[^\\x00-\\x7F]/g,'').slice(0,40) : '<none>'; };
+                const btns = Array.from(document.querySelectorAll('button'))
+                    .map(b => ({t:(b.textContent||'').trim().replace(/[^\\x00-\\x7F]/g,'').slice(0,22),
+                                d:b.disabled}))
+                    .filter(b => /search/i.test(b.t));
+                return {
+                    origin: v("p-autocomplete[formcontrolname='origin'] input"),
+                    dest:   v("p-autocomplete[formcontrolname='destination'] input"),
+                    date:   v("p-calendar[formcontrolname='journeyDate'] input"),
+                    cls:    v("p-dropdown[formcontrolname='journeyClass']"),
+                    quota:  v("p-dropdown[formcontrolname='journeyQuota']"),
+                    searchButtons: btns,
+                };
+            }""")
+            print(f"  [prefill-check] origin={pre.get('origin')!r} dest={pre.get('dest')!r} "
+                  f"date={pre.get('date')!r} cls={pre.get('cls')!r} quota={pre.get('quota')!r}")
+            print(f"  [prefill-check] searchButtons={pre.get('searchButtons')}")
+            log.info("prefill_check", **{k: str(v)[:80] for k, v in pre.items()})
+        except Exception as e:
+            print(f"  [prefill-check failed] {e}")
+
+        # Click Search and verify navigation to results. The form-fill and the
+        # click can race Angular's change detection, so the first click
+        # sometimes no-ops (page stays on /train-search). Re-click once if the
+        # results container doesn't attach. state="attached" avoids the
+        # false-negative that state="visible" triggers (the Angular host element
+        # has 0 height until results hydrate).
+        search_btn = self.page.locator(
+            "button:has-text('Search Trains'), button.search_btn, button:has-text('Search')"
+        ).first
+        for attempt in range(1, 3):
+            await search_btn.click()
+            try:
+                await self.page.wait_for_selector(
+                    "app-train-avl-enq", timeout=20_000, state="attached"
+                )
+                await asyncio.sleep(3)   # let train rows fully render
+                log.info("train_list_loaded", attempt=attempt)
+                return
+            except Exception:
+                if attempt < 2:
+                    log.warning("search_no_nav_retrying",
+                                attempt=attempt, url=self.page.url)
+                    await asyncio.sleep(2)
+                    continue
+                # Second miss — capture diagnostics and fail.
+                try:
+                    await self.page.screenshot(path="step_search_timeout.png", full_page=True)
+                    print("  [snap] step_search_timeout.png")
+                except Exception:
+                    pass
+                try:
+                    diag = await self.page.evaluate("""() => {
+                        const counts = {};
+                        ['app-train-avl-enq','app-train-list','.train-list',
+                         '[class*=\"train\"]'].forEach(s =>
+                            counts[s] = document.querySelectorAll(s).length);
+                        return {url: location.href, counts};
+                    }""")
+                    log.warning("search_results_not_found",
+                                url=diag.get("url"), counts=str(diag.get("counts")))
+                    print(f"  [search diag] url={diag.get('url')} counts={diag.get('counts')}")
+                except Exception as e:
+                    print(f"  [search diag failed] {e}")
+                raise
 
     # ── Train selection ───────────────────────────────────────────────────────
 
@@ -597,6 +723,27 @@ class PlaywrightBrowser(BrowserPort):
             print(f"  [booking/train-list] SL anchor click failed: {e}")
 
         await asyncio.sleep(0.5)  # let Angular process the click
+
+        # ── Detect Tatkal ARP / date errors ─────────────────────────────────
+        # Clicking the class on a Tatkal date outside the Advance Reservation
+        # Period surfaces an inline error + toast: "Date outside Tatkal ARP
+        # (50018)".  This is unrecoverable for this date — fail cleanly rather
+        # than spinning on the disabled Book Now button below.
+        try:
+            arp_err = await self.page.evaluate("""() => {
+                const t = (document.body.innerText || '');
+                const m = t.match(/(Date )?outside Tatkal ARP[^\\n]*|\\(50018\\)[^\\n]*/i);
+                return m ? m[0].trim().slice(0, 120) : null;
+            }""")
+        except Exception:
+            arp_err = None
+        if arp_err:
+            log.error("tatkal_arp_error", detail=arp_err)
+            raise RuntimeError(
+                f"IRCTC rejected the booking: '{arp_err}'. The journey date is "
+                "outside the Tatkal booking window (ARP) or the Tatkal window is "
+                "not open yet. Nothing was booked."
+            )
 
         # ── Click 2: the AVAILABILITY cell for the journey date ─────────────
         # The date carousel shows columns (Wed 10 Jun | Thu 11 Jun | …), each
@@ -1254,6 +1401,45 @@ class PlaywrightBrowser(BrowserPort):
                 except Exception as exc:
                     log.warning("confirm_berths_fallback_failed", err=str(exc)[:80])
 
+        # ── Decline Travel Insurance (inline Yes/No radio on psgninput) ───────
+        # IRCTC shows "Travel Insurance — Yes / No" (₹0.45/pax). It's an inline
+        # PrimeNG radio, NOT a popup. Select "No" so the required field is set.
+        try:
+            no_ins = self.page.locator(
+                "label:has-text(\"don't want\"), "
+                "label:has-text('No, I don'), "
+                "p-radiobutton:right-of(:text('No'))"
+            ).first
+            if await no_ins.count() > 0:
+                await no_ins.scroll_into_view_if_needed()
+                await no_ins.click()
+                log.info("insurance_declined")
+        except Exception as exc:
+            log.debug("insurance_decline_skip", note=str(exc)[:60])
+
+        # ── Select payment mode (radio on psgninput, BEFORE Continue) ─────────
+        # IRCTC routes payment via a coarse radio on the passenger page:
+        #   • "Pay through BHIM/UPI"  → for UPI
+        #   • "Pay through Credit & Debit Cards / Net Banking / Wallets / …"
+        #                             → for Card / e-Wallet / everything else
+        # The specific gateway selection happens later in payment.py.
+        if config.payment:
+            from core.models import PaymentMethod
+            want_bhim_upi = config.payment.method == PaymentMethod.UPI
+            label_text = "BHIM" if want_bhim_upi else "Credit"
+            try:
+                radio = self.page.locator(
+                    f"label:has-text('{label_text}')"
+                ).first
+                if await radio.count() > 0:
+                    await radio.scroll_into_view_if_needed()
+                    await radio.click()
+                    log.info("payment_mode_selected", mode=label_text)
+                else:
+                    log.warning("payment_mode_radio_not_found", wanted=label_text)
+            except Exception as exc:
+                log.warning("payment_mode_select_failed", err=str(exc)[:60])
+
         log.info("passengers_filled", count=len(config.passengers))
 
     # ── CAPTCHA ───────────────────────────────────────────────────────────────
@@ -1312,29 +1498,46 @@ class PlaywrightBrowser(BrowserPort):
     # ── Submit & confirmation ─────────────────────────────────────────────────
 
     async def submit_passenger_form(self) -> None:
-        # Click "Next" / "Proceed to Pay" to submit the passenger form.
-        # On psgninput, if get_captcha_image() already clicked Next (to trigger
-        # the CAPTCHA check), and the form had validation errors, clicking Next
-        # again here should resubmit once the form is now complete.
-        # On psgn-dtl, this is the first and only submit click.
-        try:
-            next_btn = self.page.locator(
-                "button:has-text('Next'), "
-                "button:has-text('Proceed to Pay'), "
-                "button:has-text('Proceed')"
-            ).first
-            if await next_btn.count() > 0:
-                await next_btn.click(timeout=5_000)
-                log.info("passenger_form_next_clicked")
-        except Exception as e:
-            log.warning("passenger_form_next_click_failed", error=str(e)[:80])
+        # Real flow (confirmed from manual recordings):
+        #   psgninput  --Continue-->  /booking/reviewBooking  --Continue-->  /payment
+        # The build previously waited for **/payment** directly and timed out at
+        # the review page. We now click Continue, handle the review page, then
+        # click Continue again before waiting for payment.
+        async def _click_continue() -> bool:
+            try:
+                btn = self.page.locator(
+                    "button:has-text('Continue'), "
+                    "button:has-text('Proceed to Pay'), "
+                    "button:has-text('Proceed'), "
+                    "button:has-text('Next')"
+                ).first
+                if await btn.count() > 0:
+                    await btn.click(timeout=5_000)
+                    return True
+            except Exception as e:
+                log.warning("continue_click_failed", error=str(e)[:80])
+            return False
 
-        # Wait for the payment page (handles both /payment and /nget/payment)
+        # Step 1: leave the passenger page
+        await _click_continue()
+        log.info("passenger_form_continue_clicked")
+
+        # Step 2: intermediate Review page (may be skipped on some layouts)
+        try:
+            await self.page.wait_for_url("**/booking/reviewBooking**", timeout=20_000)
+            log.info("review_booking_reached", url=self.page.url)
+            await asyncio.sleep(1)   # let the review page render
+            await _click_continue()  # Step 3: Review --Continue--> payment
+            log.info("review_booking_continue_clicked")
+        except Exception:
+            log.info("review_booking_not_seen",
+                     note="proceeding to wait for payment", url=self.page.url)
+
+        # Step 4: wait for the payment page (handles /payment and /nget/payment)
         try:
             await self.page.wait_for_url("**/payment**", timeout=30_000)
         except Exception:
-            # IRCTC sometimes shows CAPTCHA at this point (modal or inline)
-            # Take screenshot for diagnosis
+            # IRCTC may show a CAPTCHA here (modal or inline) — capture for diag.
             try:
                 await self.page.screenshot(path="step_submit_timeout.png")
             except Exception:

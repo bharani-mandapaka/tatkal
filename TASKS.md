@@ -316,3 +316,72 @@ if this ever touches another person's data.
 - Login false-positive re-check (`browser.py:146`) and no-hard-reload session guard
   (`browser.py:296`) — genuinely smart IRCTC-specific defenses.
 - Hexagonal ports make the whole stack mock-testable. 109 tests pass, 3 xfail.
+
+---
+
+## Manual Booking Video Findings 🎥 (2026-06-19)
+
+Charted the real flow from two screen recordings (GENERAL full flow → review;
+TATKAL outside-hours → blocked at ARP). Deltas vs the built `browser.py`:
+
+### 🔴 Flow-breaking (likely why dry run never reaches payment)
+- [ ] **Missing `reviewBooking` step.** Real flow is `psgninput → /booking/reviewBooking →
+  /payment`. `submit_passenger_form()` waited for `**/payment**` directly and would time
+  out at the review page. Fix: after Continue, detect reviewBooking, click Continue again,
+  then wait for payment. *(browser.py submit_passenger_form)* — **FIXED 2026-06-19**
+- [ ] **Payment mode is chosen on the passenger page**, not a later page — a coarse radio:
+  "Credit/Debit/NetBanking/Wallets/EMI/UPI_CC/UPI_CL" vs "BHIM/UPI". Must select it on
+  psgninput before Continue. *(browser.py fill_passenger_details)* — **FIXED 2026-06-19**
+
+### 🟠 New steps / failure modes
+- [ ] **Welcome/language modal on fresh landing** — combines the Aadhaar "Authenticate now"
+  alert with a हिंदी / English choice. Must click **English** (never "Authenticate now").
+  Build only closed generic modals. *(browser.py login)* — **FIXED 2026-06-19**
+- [ ] **"Date outside Tatkal ARP (50018)"** error fires on the class-tab click when the
+  date is outside the Tatkal advance-reservation window. Must detect + fail cleanly, not
+  hang. *(browser.py _proceed_from_booking_train_list)* — **FIXED 2026-06-19**
+- [ ] **Travel Insurance is an inline Yes/No radio** on psgninput (₹0.45/pax), not a
+  "Skip/No Thanks" popup. Must select "No". *(browser.py fill_passenger_details)*
+  — **FIXED 2026-06-19**
+
+### 🔵 Confirmed / notes
+- [ ] **Login CAPTCHA did NOT appear** in either recording (an "OTP instead of CAPTCHA"
+  option exists). Agent must not *require* a login CAPTCHA. *(already OK — handles if present)*
+- [ ] **Chrome saved-password autofill** (Windows-PIN popup) is machine-specific — agent
+  must rely on manual type-username/password + Sign In, never on autofill. *(already OK)*
+- [ ] **Aadhaar OTP location still UNKNOWN** — GENERAL doesn't need it; TATKAL was blocked
+  at the ARP error before reaching it. Still requires a real in-window run to observe.
+- [x] Confirmed the build's train-list two-click pattern (class anchor → availability cell
+  → Book Now) and availability badge formats (`RAC 26`, `AVAILABLE-0112`) match reality.
+
+> ⚠️ All browser.py fixes above are **video-grounded but not yet verified against live
+> IRCTC** — they degrade gracefully (try/except) but need a real run to confirm selectors.
+
+### Dry-run results — live IRCTC, 2026-06-22 (2 runs, GENERAL quota, date overridden)
+- [x] ✅ **Welcome/English modal fix VERIFIED LIVE** (`welcome_modal_english_selected` logged).
+- [x] ✅ Login (manual type + Sign In, no login CAPTCHA), session-reuse guard, and form
+  prefill all worked.
+- [x] 🔴→✅ **Search blocker ROOT-CAUSED & FIXED (verified below).** Runs 1–2 timed out on
+  `/nget/train-search` (no `app-train-avl-enq`). Diagnosis via prefill-readback (run 3): the
+  form *fills* correctly but the **Angular reactive-form model isn't committed before the
+  Search click** → form invalid → click is a no-op → no navigation. NOT selector drift.
+  Fix in `prefill_search_form`: validate-and-re-fill loop (read back origin/dest/date,
+  re-fill any missing field, up to 2 passes) + `search_trains` re-clicks once on miss.
+  *(browser.py prefill_search_form / search_trains)*
+
+### Verification run — live IRCTC, 2026-06-22 (search fix confirmed)
+- [x] ✅ **Search fix VERIFIED WORKING** — `train_list_loaded attempt=1` (clean first-attempt
+  search, no flake). Prefill readback correct: `origin='MGR CHENNAI CTL - MAS (CHENNAI)'
+  dest='CHENGALPATTU JN - CGL (KANCHIPURAM)' date='04/07/2026' cls='Sleeper (SL)'
+  quota='GENERAL'`. The race-condition fix holds.
+- [ ] 🔴 **NEW BLOCKER (confirmed): submit → payment navigation fails.** Flow reaches
+  SUBMITTING then stalls: `review_booking_not_seen note='proceeding to wait for payment'
+  url=…/nget/booking/psgninput`, then 30s timeout waiting for `**/payment**`. The page
+  **never leaves `/booking/psgninput`** — it reaches neither `reviewBooking` nor `payment`.
+  The Continue click (and/or the payment-mode + insurance selections that gate it) isn't
+  advancing the page. `step_submit_timeout.png` earlier showed the Payment-Mode radios still
+  on-page. **Next:** capture the psgninput DOM at submit time — confirm the real Continue
+  button label/selector and which validation (insurance radio? payment-mode radio? passenger
+  field?) is blocking the form. *(browser.py submit_passenger_form / fill_passenger_details)*
+- [ ] ⚠️ **Caution:** avoid rapid repeated live logins to the real account (bot-detection
+  risk). Space diagnostic runs out.
