@@ -3,7 +3,7 @@ import questionary
 from questionary import Style
 
 from core.models import TravelClass, Gender, BerthPreference, IDType, PaymentMethod
-from config import save_config
+from config import save_config, MIN_PASSPHRASE_LEN
 
 _STYLE = Style([
     ("qmark", "fg:#673ab7 bold"),
@@ -125,13 +125,21 @@ def collect() -> None:
 
     # ── Passphrase + save ──────────────────────────────────────────────────────
     print()
+    print(f"  There is no recovery if you forget this — it is not stored anywhere,")
+    print(f"  including by us. Write it down somewhere safe (password manager, etc).")
     passphrase = questionary.password(
-        "Set passphrase to encrypt your config:", style=_STYLE
+        f"Set passphrase to encrypt your config (min {MIN_PASSPHRASE_LEN} chars):",
+        style=_STYLE,
     ).ask()
     confirm = questionary.password("Confirm passphrase:", style=_STYLE).ask()
 
     if passphrase != confirm:
         print("\n✗ Passphrases do not match — run collector again.\n")
+        return
+
+    if len(passphrase) < MIN_PASSPHRASE_LEN:
+        print(f"\n✗ Passphrase must be at least {MIN_PASSPHRASE_LEN} characters — "
+              "run collector again.\n")
         return
 
     save_config(

@@ -13,6 +13,12 @@ _HERE = Path(__file__).resolve().parent
 CONFIG_PATH = _HERE / "booking_config.enc"
 SALT_PATH   = _HERE / "booking_salt.bin"
 
+# A weak passphrase is the real attack surface here, not the cipher (PBKDF2
+# 480k + Fernet is fine). There is no recovery path if it's lost or brute-
+# forced — enforce a minimum length at the one place every local save funnels
+# through.
+MIN_PASSPHRASE_LEN = 8
+
 
 def _derive_key(passphrase: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
@@ -25,6 +31,10 @@ def _derive_key(passphrase: str, salt: bytes) -> bytes:
 
 
 def save_config(data: dict, passphrase: str) -> None:
+    if len(passphrase) < MIN_PASSPHRASE_LEN:
+        raise ValueError(
+            f"Passphrase must be at least {MIN_PASSPHRASE_LEN} characters."
+        )
     salt = os.urandom(16)
     SALT_PATH.write_bytes(salt)
     key = _derive_key(passphrase, salt)

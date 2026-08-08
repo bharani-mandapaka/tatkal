@@ -144,20 +144,34 @@ and one real end-to-end PNR exists. Current build = flow-automation prototype.
 
 ### 🟡 Medium (correctness / robustness)
 
-- [ ] **Silent name truncation** — names >15 chars chopped with no warning
+- [x] **Silent name truncation** — names >15 chars chopped with no warning
   (`models.py:56`); truncated name may not match Aadhaar/ID at boarding. Add visible
   warning + ID-match note. *(user-stories D1, test-scenarios S7)*
+  — **DONE 2026-08-09**: `Passenger.__post_init__` now prints + logs
+  (`passenger_name_truncated`) the original vs. truncated name so a boarding-time ID
+  mismatch can be caught before travel day.
 - [ ] **Berth dropdown re-render race** — dropdown shifts nth(3)→nth(2) after gender
   select (CLAUDE.md); non-deterministic. Add post-select verification/retry.
   *(test-scenarios S8)*
-- [ ] **Class-priority loop timing** — serial `read_availability_for_class` calls
+- [x] **Class-priority loop timing** — serial `read_availability_for_class` calls
   (`booking_flow.py:185`) burn the window. Cap list to 2 or read in parallel.
   *(red-team #2)*
+  — **DONE 2026-08-09**: `_check_availability_and_decide` now reads all
+  `class_priority` classes concurrently via `asyncio.gather` (`return_exceptions=True`,
+  a failed read degrades to "skip" instead of crashing the whole batch), then evaluates
+  decisions in priority order as before. Decision semantics unchanged — only the reads
+  are now concurrent instead of serial.
 - [ ] **Verify `read_availability_for_class` reads the badge without the commit-click**
   — CLAUDE.md says train-list needs 2 clicks to enable booking; the read-then-decide
   architecture is invalid if reading requires committing. *(red-team #4)*
-- [ ] **Passenger input validation** — empty name, negative age, age >150, accented
+- [x] **Passenger input validation** — empty name, negative age, age >150, accented
   chars, apostrophes all currently accepted (`models.py` Passenger). *(dummy-dataset)*
+  — **DONE 2026-08-09**: empty/whitespace-only name and age outside 0–125 now raise
+  `ValueError` at construction. Accented names (José) and apostrophes (D'Souza) are
+  still accepted **on purpose** — those are valid real names; Playwright's
+  `keyboard.type()` already handles Unicode correctly, so there was no actual typing
+  risk to fix there. Un-xfailed the 3 corresponding tests in `test_adversarial.py` +
+  added boundary/whitespace/truncation-message tests (all passing, 116 total).
 - [ ] **Availability parser unknown statuses** — `CHART PREPARED`, `BOOKING CLOSED`,
   concatenated badges, Hindi text fall through to UNKNOWN→skip (safe, but verify real
   IRCTC strings). *(dummy-dataset)*
@@ -271,12 +285,22 @@ if this ever touches another person's data.
 - [ ] **Sensitive screenshots written to disk unencrypted** — `step_pax_form.png` etc.
   capture passenger names, ages, **ID numbers** in plaintext on every run. Gate behind a
   `DEBUG` flag; scrub or encrypt. *(browser.py:815 + ~12 more call sites)*
-- [ ] **No passphrase-strength enforcement** (collector + web form). A weak passphrase
+- [x] **No passphrase-strength enforcement** (collector + web form). A weak passphrase
   collapses the whole encryption — this is the real attack surface, not the cipher.
+  — **DONE 2026-08-09**: `config.save_config()` (the one choke point every local save
+  goes through) now rejects passphrases under `MIN_PASSPHRASE_LEN=8`; `collector.py`
+  checks it too (friendly re-prompt) and now warns up front that there is no recovery
+  if it's lost. `api/index.py` enforces the same minimum server-side via the new
+  `ConfigureRequest` Pydantic model. (Prompted by hitting this exact wall this session —
+  a forgotten passphrase has no recovery path by design.)
 - [ ] **`session.json` cookies stored plaintext** in cwd — leaked file = IRCTC session
   hijack. Confirm `.gitignore` covers it; consider encrypting. *(browser.py:23)*
 - [ ] **No log scrubber** (plan claimed one). `username` + header snippets (PII) logged.
   *(browser.py:183, browser.py:263)*
+  — **PARTIAL 2026-08-09**: `username` is now masked (`me***l` style) at all 3
+  `login_*` log sites in `browser.py`, so console output is safe to paste for
+  diagnostics. The `is_logged_in_false_diag` header-snippet dump (can contain the
+  logged-in user's display name) is still unscrubbed — left open.
 
 ### 🟠 WhatsApp HITL — dangling component (docs overstate it)
 - [ ] **Not wired end-to-end.** `deliver_reply` is called only by tests; there is **no
@@ -291,17 +315,33 @@ if this ever touches another person's data.
   (the thing it must eventually handle). *(captcha_admin_hitl.py:29)*
 
 ### 🟡 Automation robustness (`browser.py`)
-- [ ] **`force=True` on Book Now bypasses the `disable-book` guard** — can click a
+- [x] **`force=True` on Book Now bypasses the `disable-book` guard** — can click a
   genuinely-disabled (not-bookable) button → undefined downstream state. *(browser.py:740)*
-- [ ] **`train_number in page.content()`** substring match → false-positive risk (number
+  — **DONE 2026-08-09**: the poll loop now tracks whether Book Now actually became
+  enabled; if it never does (10 attempts / 5s), raise `RuntimeError` instead of
+  force-clicking a still-disabled button. `force=True` is now documented as bypassing
+  only Playwright's actionability check, not IRCTC's disabled state — which is already
+  confirmed `False` by the time the click happens.
+- [x] **`train_number in page.content()`** substring match → false-positive risk (number
   could match a price/time/other train). Scope the check to train-card elements. *(browser.py:408)*
+  — **DONE 2026-08-09**: replaced the raw-HTML substring check in
+  `find_and_select_train` with a JS scan scoped to `app-train-avl-enq` card elements
+  (same pattern already used elsewhere in the file for class-tab matching).
 - [ ] **Entirely selector-dependent** ("as of mid-2025"); no selector-drift detection —
   the #1 ongoing breakage risk. Consider a pre-run selector smoke-check. *(browser.py:4)*
 
 ### 🟡 Web backend (`/api/configure`)
-- [ ] **Zero server-side validation** — accepts any JSON shape; no field types,
+- [x] **Zero server-side validation** — accepts any JSON shape; no field types,
   passenger-count cap, or age/string sanity. Malformed input flows into the encrypted
   config and breaks later at `_build_config`. *(api/index.py:66)*
+  — **DONE 2026-08-09**: added `ConfigureRequest`/`PassengerIn`/`PaymentIn` Pydantic
+  models — field types, age 0–125, name 1–15 chars, 1–4 passengers, valid
+  gender/berth/id_type/travel_class enums, DD-MM-YYYY date format, payment
+  method-specific required fields, and the passphrase-strength check. Bad input now
+  gets a 422 with a field-level message instead of silently reaching `_build_config`.
+  Verified with 16 hand-written cases (valid + 15 invalid variants) plus 2 route-level
+  `TestClient` checks in an isolated venv (fastapi/pydantic aren't in the local agent's
+  env) — all passed. Not yet run against the live Vercel deploy.
 - [ ] **No rate limiting / body-size limit** — DoS-able (low impact; stateless). *(api/index.py:55)*
 
 ### 🔵 Hygiene / consistency

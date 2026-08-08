@@ -172,21 +172,36 @@ class BookingFlow:
         self, config: BookingConfig
     ) -> tuple[str, str]:
         """
-        Stage 4: iterate class_priority list, read live availability for each,
-        evaluate against BookingThresholds, and return (class_value, "book").
+        Stage 4: read live availability for every class in class_priority
+        CONCURRENTLY — serial reads burn window time that matters when the
+        whole Tatkal window is seconds wide (red-team #2) — then evaluate
+        against BookingThresholds in priority order and return
+        (class_value, "book").
 
         Raises RuntimeError (with Stage 5B table printed) if no class passes.
         """
         failure_rows: list[tuple[str, str, str]] = []
 
+        self._transition(BookingState.READING_AVAILABILITY,
+                         classes=config.class_priority)
+        raw_results = await asyncio.gather(
+            *(
+                self.browser.read_availability_for_class(config.train_number, cls)
+                for cls in config.class_priority
+            ),
+            return_exceptions=True,
+        )
+
         print(f"\n  {'Class':<6}  {'Availability':<30}  Decision")
         print("  " + "-" * 55)
 
-        for cls in config.class_priority:
-            self._transition(BookingState.READING_AVAILABILITY, cls=cls)
-            raw = await self.browser.read_availability_for_class(
-                config.train_number, cls
-            )
+        for cls, raw in zip(config.class_priority, raw_results):
+            if isinstance(raw, BaseException):
+                log.warning("read_availability_for_class_failed", cls=cls, error=str(raw))
+                print(f"  {cls:<6}  {'<read failed>':<30}  → skip")
+                failure_rows.append((cls, "READ_FAILED", str(raw)[:60]))
+                continue
+
             result = parse_availability(raw)
             decision = evaluate_threshold(
                 result, config.thresholds, passenger_count=len(config.passengers)

@@ -13,15 +13,118 @@ import base64
 import io
 import json
 import os
+import re
 import zipfile
+from typing import Literal, Optional
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 app = FastAPI(title="Tatkal Agent")
+
+# Mirrors core/models.py enums — kept as plain sets here since this serverless
+# function doesn't import the local agent package.
+_VALID_CLASSES  = {"SL", "3A", "2A", "1A", "CC", "EC", "3E", "2S"}
+_VALID_GENDERS  = {"M", "F", "T"}
+_VALID_BERTHS   = {"LB", "MB", "UB", "SL", "SU", "NO PREFERENCE"}
+_VALID_ID_TYPES = {"AADHAAR CARD", "PAN CARD", "VOTER ID CARD", "PASSPORT", "DRIVING LICENCE"}
+MIN_PASSPHRASE_LEN = 8
+
+
+# ── Request validation ─────────────────────────────────────────────────────────
+# Server-side mirror of the client-side JS checks: the browser form isn't the
+# only way to reach this endpoint, and malformed input previously flowed
+# straight into the encrypted config and broke later at _build_config.
+
+class PassengerIn(BaseModel):
+    name: str = Field(min_length=1, max_length=15)
+    age: int = Field(ge=0, le=125)
+    gender: str
+    berth_preference: str
+    id_type: str
+    id_number: str = Field(min_length=1)
+
+    @field_validator("gender")
+    @classmethod
+    def _gender(cls, v: str) -> str:
+        if v not in _VALID_GENDERS:
+            raise ValueError(f"must be one of {sorted(_VALID_GENDERS)}")
+        return v
+
+    @field_validator("berth_preference")
+    @classmethod
+    def _berth(cls, v: str) -> str:
+        if v not in _VALID_BERTHS:
+            raise ValueError(f"must be one of {sorted(_VALID_BERTHS)}")
+        return v
+
+    @field_validator("id_type")
+    @classmethod
+    def _id_type(cls, v: str) -> str:
+        if v not in _VALID_ID_TYPES:
+            raise ValueError(f"must be one of {sorted(_VALID_ID_TYPES)}")
+        return v
+
+
+class PaymentIn(BaseModel):
+    method: Literal["UPI", "CARD", "EWALLET"]
+    upi_id: Optional[str] = None
+    wallet_mpin: Optional[str] = None
+    card_number: Optional[str] = None
+    card_expiry: Optional[str] = None
+    card_cvv: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _method_fields_present(self) -> "PaymentIn":
+        if self.method == "UPI" and not self.upi_id:
+            raise ValueError("upi_id is required for UPI payment")
+        if self.method == "EWALLET" and not self.wallet_mpin:
+            raise ValueError("wallet_mpin is required for EWALLET payment")
+        if self.method == "CARD" and not (self.card_number and self.card_expiry and self.card_cvv):
+            raise ValueError("card_number, card_expiry, and card_cvv are required for CARD payment")
+        return self
+
+
+class ConfigureRequest(BaseModel):
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+    train_number: str = Field(min_length=1, max_length=5)
+    from_station: str = Field(min_length=1, max_length=10)
+    to_station: str = Field(min_length=1, max_length=10)
+    journey_date: str
+    travel_class: str = "SL"
+    boarding_point: Optional[str] = ""
+    passengers: list[PassengerIn] = Field(min_length=1, max_length=4)
+    mobile: str = ""
+    payment: PaymentIn
+    book_only_if_confirmed: bool = True
+    captcha_api_key: Optional[str] = None
+    passphrase: str
+
+    @field_validator("travel_class")
+    @classmethod
+    def _travel_class(cls, v: str) -> str:
+        if v not in _VALID_CLASSES:
+            raise ValueError(f"must be one of {sorted(_VALID_CLASSES)}")
+        return v
+
+    @field_validator("journey_date")
+    @classmethod
+    def _journey_date(cls, v: str) -> str:
+        if not re.match(r"^\d{2}-\d{2}-\d{4}$", v):
+            raise ValueError("must be DD-MM-YYYY")
+        return v
+
+    @field_validator("passphrase")
+    @classmethod
+    def _passphrase_strength(cls, v: str) -> str:
+        if len(v.strip()) < MIN_PASSPHRASE_LEN:
+            raise ValueError(f"must be at least {MIN_PASSPHRASE_LEN} characters")
+        return v.strip()
 
 
 # ── Encryption (mirrors config.py but fully in-memory) ────────────────────────
@@ -55,31 +158,35 @@ async def health():
 @app.post("/api/configure")
 async def configure(request: Request):
     try:
-        data = await request.json()
+        raw = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    passphrase = data.pop("passphrase", "").strip()
-    if not passphrase:
-        return JSONResponse({"error": "Passphrase is required"}, status_code=400)
+    try:
+        payload = ConfigureRequest.model_validate(raw)
+    except ValidationError as e:
+        # Compact field: message list — avoids leaking pydantic's internal
+        # error shape while still telling the user what to fix.
+        details = [f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in e.errors()]
+        return JSONResponse({"error": "Invalid input", "details": details}, status_code=422)
 
     config = {
-        "username":              data.get("username", ""),
-        "password":              data.get("password", ""),
-        "train_number":          data.get("train_number", ""),
-        "from_station":          data.get("from_station", "").upper(),
-        "to_station":            data.get("to_station", "").upper(),
-        "journey_date":          data.get("journey_date", ""),
-        "travel_class":          data.get("travel_class", "SL"),
-        "boarding_point":        (data.get("boarding_point") or data.get("from_station", "")).upper(),
-        "passengers":            data.get("passengers", []),
-        "mobile":                data.get("mobile", ""),
-        "payment":               data.get("payment", {}),
-        "book_only_if_confirmed": data.get("book_only_if_confirmed", True),
-        "captcha_api_key":       data.get("captcha_api_key") or None,
+        "username":              payload.username,
+        "password":              payload.password,
+        "train_number":          payload.train_number,
+        "from_station":          payload.from_station.upper(),
+        "to_station":            payload.to_station.upper(),
+        "journey_date":          payload.journey_date,
+        "travel_class":          payload.travel_class,
+        "boarding_point":        (payload.boarding_point or payload.from_station).upper(),
+        "passengers":            [p.model_dump() for p in payload.passengers],
+        "mobile":                payload.mobile,
+        "payment":               payload.payment.model_dump(exclude_none=True),
+        "book_only_if_confirmed": payload.book_only_if_confirmed,
+        "captcha_api_key":       payload.captcha_api_key or None,
     }
 
-    enc_bytes, salt_bytes = encrypt_config(config, passphrase)
+    enc_bytes, salt_bytes = encrypt_config(config, payload.passphrase)
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:

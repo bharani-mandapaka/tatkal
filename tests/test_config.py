@@ -48,27 +48,35 @@ def test_config_not_stored_in_plaintext():
 
 def test_config_exists_true_after_save():
     assert not config_exists()
-    save_config(_DATA, "x")
+    save_config(_DATA, "passphrase1")
     assert config_exists()
 
 
 def test_config_exists_false_when_salt_missing():
-    save_config(_DATA, "x")
+    save_config(_DATA, "passphrase1")
     cfg_module.SALT_PATH.unlink()
     assert not config_exists()
 
 
 def test_different_passphrases_produce_different_ciphertext():
-    save_config(_DATA, "pass_a")
+    save_config(_DATA, "passphrase_a")
     ct_a = cfg_module.CONFIG_PATH.read_bytes()
-    save_config(_DATA, "pass_b")
+    save_config(_DATA, "passphrase_b")
     ct_b = cfg_module.CONFIG_PATH.read_bytes()
     assert ct_a != ct_b
 
 
 def test_salt_is_random_across_saves():
-    save_config(_DATA, "x")
+    save_config(_DATA, "passphrase1")
     salt_a = cfg_module.SALT_PATH.read_bytes()
-    save_config(_DATA, "x")
+    save_config(_DATA, "passphrase1")
     salt_b = cfg_module.SALT_PATH.read_bytes()
     assert salt_a != salt_b
+
+
+def test_weak_passphrase_rejected():
+    """A weak passphrase is the real attack surface (PBKDF2+Fernet is fine) —
+    save_config must refuse anything under MIN_PASSPHRASE_LEN."""
+    with pytest.raises(ValueError):
+        save_config(_DATA, "short")
+    assert not config_exists()

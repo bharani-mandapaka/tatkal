@@ -2,6 +2,10 @@ from dataclasses import dataclass, field
 from typing import Optional, List
 from enum import Enum
 
+from logger import get_logger
+
+log = get_logger()
+
 
 class TravelClass(str, Enum):
     SL = "SL"
@@ -53,8 +57,21 @@ class Passenger:
     id_number: str
 
     def __post_init__(self):
+        if not self.name or not self.name.strip():
+            raise ValueError("Passenger name cannot be empty")
+        if not 0 <= self.age <= 125:
+            raise ValueError(
+                f"Passenger age {self.age} is out of range (0-125) for {self.name!r}"
+            )
         if len(self.name) > 15:
+            # IRCTC truncates to 15 chars silently — surface it here instead,
+            # since a truncated name can fail to match the passenger's ID at
+            # boarding (TTE checks name-on-ticket against the ID document).
+            original = self.name
             self.name = self.name[:15]
+            print(f"  [!] Passenger name truncated to fit IRCTC's 15-char limit: "
+                  f"{original!r} -> {self.name!r} — verify this still matches the ID.")
+            log.warning("passenger_name_truncated", original=original, truncated=self.name)
 
 
 @dataclass

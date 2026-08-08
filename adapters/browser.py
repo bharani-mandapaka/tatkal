@@ -26,6 +26,14 @@ COOKIE_PATH = Path("session.json")
 _TYPE_DELAY = 40
 
 
+def _mask(s: str) -> str:
+    """Redact a credential for logging — keep enough to confirm identity in
+    diagnostics without exposing it in console output / pasted logs."""
+    if not s:
+        return ""
+    return s[0] + "***" if len(s) <= 4 else s[:2] + "***" + s[-1]
+
+
 class PlaywrightBrowser(BrowserPort):
     def __init__(self):
         self._playwright = None
@@ -119,7 +127,7 @@ class PlaywrightBrowser(BrowserPort):
 
         # If session cookies are still valid, skip the full login flow entirely
         if await self.is_logged_in():
-            log.info("login_session_reused", username=username)
+            log.info("login_session_reused", username=_mask(username))
             return True
 
         # Close any modal/popup if present
@@ -217,7 +225,7 @@ class PlaywrightBrowser(BrowserPort):
             # Persist session cookies
             cookies = await self._context.cookies()
             COOKIE_PATH.write_text(json.dumps(cookies), encoding="utf-8")
-            log.info("login_success", username=username, verified=True)
+            log.info("login_success", username=_mask(username), verified=True)
             return True
         except Exception as e:
             # Login timed out — IRCTC may have shown a CAPTCHA after submit.
@@ -240,7 +248,7 @@ class PlaywrightBrowser(BrowserPort):
                     )
                     cookies = await self._context.cookies()
                     COOKIE_PATH.write_text(json.dumps(cookies), encoding="utf-8")
-                    log.info("login_success", username=username, verified=True,
+                    log.info("login_success", username=_mask(username), verified=True,
                              note="captcha_retry")
                     return True
                 except Exception as e2:
@@ -526,12 +534,17 @@ class PlaywrightBrowser(BrowserPort):
         except Exception:
             pass
 
-        # Try to find train by searching the entire page content
-        # The train number might be in different DOM structures
-        all_text = await self.page.content()
-        print(f"  [debug] '{train_number}' in page HTML: {train_number in all_text}")
+        # Check for the train number scoped to actual train-card elements —
+        # a raw page.content() substring match can false-positive on the
+        # number appearing in an unrelated fare, time, or another train's
+        # number elsewhere on the page.
+        train_found = await self.page.evaluate(
+            f"() => Array.from(document.querySelectorAll('app-train-avl-enq'))"
+            f".some(c => c.textContent.includes('{train_number}'))"
+        )
+        print(f"  [debug] '{train_number}' found in a train card: {train_found}")
 
-        if train_number not in all_text:
+        if not train_found:
             raise RuntimeError(
                 f"Train {train_number} not found on page. "
                 "Check the train number, date, and quota in your config. "
@@ -839,6 +852,8 @@ class PlaywrightBrowser(BrowserPort):
                         journey_date=config.journey_date)
 
         # ── Poll until 'disable-book' is gone (up to 5 s) ───────────────────
+        book_now_enabled = False
+        last_bn_state = None
         for attempt in range(10):
             await asyncio.sleep(0.5)
             try:
@@ -854,6 +869,7 @@ class PlaywrightBrowser(BrowserPort):
                                         disabled: b.disabled,
                                         cls: b.className.slice(0, 80)}}));
                 }}""")
+                last_bn_state = bn_state
                 disabled = any(
                     b.get("disabled") or "disable-book" in b.get("cls", "")
                     for b in (bn_state or [])
@@ -862,6 +878,7 @@ class PlaywrightBrowser(BrowserPort):
                       f"disabled={disabled}  cls={bn_state[0].get('cls','') if bn_state else '?'}")
                 if not disabled and bn_state:
                     log.info("booking_train_list_book_now_enabled", attempt=attempt+1)
+                    book_now_enabled = True
                     break
             except Exception as exc:
                 print(f"  [booking/train-list] poll error: {exc}")
@@ -873,6 +890,21 @@ class PlaywrightBrowser(BrowserPort):
         except Exception:
             pass
 
+        # Book Now never became enabled — do NOT force-click a genuinely
+        # disabled button into undefined downstream state (force=True bypasses
+        # Playwright's actionability check, not IRCTC's own disabled state).
+        # This combination is very likely not bookable — fail loudly instead
+        # of guessing what happens on the other side of a disabled click.
+        if not book_now_enabled:
+            log.error("booking_train_list_book_now_stayed_disabled",
+                      state=str(last_bn_state)[:200])
+            raise RuntimeError(
+                f"Book Now stayed disabled for {tn} ({tc}) after selecting "
+                "class + date — this combination is likely not bookable "
+                "(quota exhausted, invalid date, or a stale selection). "
+                "Nothing was booked."
+            )
+
         # ── Click Book Now (Playwright locator — respects scroll + visibility) ─
         try:
             book_btn = (
@@ -882,8 +914,9 @@ class PlaywrightBrowser(BrowserPort):
                     .locator("button:has-text('Book Now')")
                     .first
             )
-            # force=True bypasses the disable-book CSS guard so Angular's click
-            # handler receives the event; it will then validate internally.
+            # force=True bypasses Playwright's own actionability check (e.g. a
+            # covered/animating element) — NOT IRCTC's disabled state, which
+            # is already confirmed False above.
             await book_btn.click(force=True, timeout=5_000)
             log.info("booking_train_list_book_now_clicked")
             print("  [booking/train-list] Book Now clicked")
@@ -1503,6 +1536,59 @@ class PlaywrightBrowser(BrowserPort):
         # The build previously waited for **/payment** directly and timed out at
         # the review page. We now click Continue, handle the review page, then
         # click Continue again before waiting for payment.
+        async def _dump_form_state(tag: str) -> None:
+            # Same diagnosis class as the search-button race: don't guess why
+            # Continue no-ops, read the actual button/radio/validation state.
+            try:
+                diag = await self.page.evaluate(r"""() => {
+                    const ascii = s => (s || '').replace(/[^\x00-\x7F]/g, '');
+                    const buttons = Array.from(document.querySelectorAll('button'))
+                        .map(b => ({
+                            text: ascii((b.textContent || '').trim()).slice(0, 40),
+                            disabled: b.disabled || b.getAttribute('aria-disabled') === 'true'
+                                      || b.classList.contains('ui-state-disabled'),
+                            visible: !!(b.offsetWidth || b.offsetHeight || b.getClientRects().length),
+                        }))
+                        .filter(b => /continue|proceed|next/i.test(b.text));
+                    const radios = Array.from(document.querySelectorAll('p-radiobutton, input[type="radio"]'))
+                        .map(r => {
+                            const box = r.querySelector
+                                ? r.querySelector('.p-radiobutton-box, .ui-radiobutton-box') : null;
+                            const checked = (r.tagName === 'INPUT') ? r.checked :
+                                (box ? /highlight|checked/.test(box.className || '') : null);
+                            const label = ascii((r.closest('div')?.textContent || '').trim()).slice(0, 30);
+                            return { label, checked };
+                        })
+                        .filter(r => r.label);
+                    const invalid = Array.from(document.querySelectorAll('.ng-invalid, [aria-invalid="true"]'))
+                        .filter(e => e.offsetWidth || e.offsetHeight)
+                        .map(e => ascii(e.tagName + '.' + (e.className || '')).slice(0, 60));
+                    const errors = Array.from(
+                        document.querySelectorAll('.error, .p-message, .ui-message, [class*="error"]')
+                    )
+                        .filter(e => (e.offsetWidth || e.offsetHeight) && e.textContent.trim())
+                        .map(e => ascii(e.textContent.trim()).slice(0, 80));
+                    return {
+                        url: location.href, buttons, radios: radios.slice(0, 15),
+                        invalidCount: invalid.length, invalidSample: invalid.slice(0, 8),
+                        errors: errors.slice(0, 5),
+                    };
+                }""")
+                log.info(f"psgninput_diag_{tag}",
+                         url=diag.get("url"), buttons=str(diag.get("buttons"))[:300],
+                         radios=str(diag.get("radios"))[:300],
+                         invalid_count=diag.get("invalidCount"),
+                         invalid_sample=str(diag.get("invalidSample"))[:200],
+                         errors=str(diag.get("errors"))[:200])
+                print(f"  [psgninput diag/{tag}] buttons={diag.get('buttons')}")
+                print(f"  [psgninput diag/{tag}] radios={diag.get('radios')}")
+                print(f"  [psgninput diag/{tag}] invalid={diag.get('invalidCount')} "
+                      f"sample={diag.get('invalidSample')}")
+                if diag.get("errors"):
+                    print(f"  [psgninput diag/{tag}] errors={diag.get('errors')}")
+            except Exception as e:
+                print(f"  [psgninput diag/{tag} failed] {e}")
+
         async def _click_continue() -> bool:
             try:
                 btn = self.page.locator(
@@ -1518,9 +1604,29 @@ class PlaywrightBrowser(BrowserPort):
                 log.warning("continue_click_failed", error=str(e)[:80])
             return False
 
-        # Step 1: leave the passenger page
-        await _click_continue()
-        log.info("passenger_form_continue_clicked")
+        # Step 1: leave the passenger page. Same race-condition class as the
+        # search-button bug — dump state BEFORE clicking (ground truth even on
+        # a run that otherwise succeeds), then retry once if the URL doesn't
+        # move off psgninput within a few seconds.
+        await _dump_form_state("pre_continue")
+        for attempt in range(1, 3):
+            await _click_continue()
+            log.info("passenger_form_continue_clicked", attempt=attempt)
+            try:
+                await self.page.wait_for_url(
+                    lambda url: "psgninput" not in url, timeout=4_000
+                )
+                break
+            except Exception:
+                if attempt < 2:
+                    log.warning("continue_no_nav_retrying", url=self.page.url)
+                    continue
+                await _dump_form_state("stuck_after_continue")
+                try:
+                    await self.page.screenshot(path="step_submit_stuck.png", full_page=True)
+                    print("  [snap] step_submit_stuck.png")
+                except Exception:
+                    pass
 
         # Step 2: intermediate Review page (may be skipped on some layouts)
         try:

@@ -4,7 +4,7 @@ Runnable adversarial tests, driven by tests/fixtures_adversarial.py.
 Covers the confident-batch fixes from the stress-test pass:
   - AVAILABLE-0 / short-count guard in evaluate_threshold
   - parser robustness against messy real-world badge strings
-Passenger-validation cases are xfail (not yet implemented — see TASKS.md 🟡).
+  - Passenger name/age validation (empty name, out-of-range age)
 """
 import pytest
 
@@ -77,19 +77,32 @@ def _passenger(name="Test", age=30):
     )
 
 
-@pytest.mark.xfail(reason="age validation not yet implemented — TASKS.md 🟡", strict=False)
 def test_passenger_rejects_negative_age():
-    with pytest.raises((ValueError, AssertionError)):
+    with pytest.raises(ValueError):
         _passenger(age=-1)
 
 
-@pytest.mark.xfail(reason="age validation not yet implemented — TASKS.md 🟡", strict=False)
 def test_passenger_rejects_absurd_age():
-    with pytest.raises((ValueError, AssertionError)):
+    with pytest.raises(ValueError):
         _passenger(age=150)
 
 
-@pytest.mark.xfail(reason="empty-name validation not yet implemented — TASKS.md 🟡", strict=False)
 def test_passenger_rejects_empty_name():
-    with pytest.raises((ValueError, AssertionError)):
+    with pytest.raises(ValueError):
         _passenger(name="")
+
+
+def test_passenger_rejects_whitespace_only_name():
+    with pytest.raises(ValueError):
+        _passenger(name="   ")
+
+
+def test_passenger_accepts_boundary_ages():
+    assert _passenger(age=0).age == 0
+    assert _passenger(age=125).age == 125
+
+
+def test_passenger_name_truncation_still_works(capsys):
+    p = _passenger(name="Subrahmanyam Venkataraman")
+    assert p.name == "Subrahmanyam Ve"
+    assert "truncated" in capsys.readouterr().out.lower()
