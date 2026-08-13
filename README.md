@@ -294,23 +294,6 @@ CAPTCHA ports** — no real browser or IRCTC needed for unit tests. See
 
 ---
 
-## 🚧 Known limitations & roadmap
-
-| Area | Status |
-|---|---|
-| Passenger-form submit → payment | ❌ **Currently broken** — flow stalls on `/booking/psgninput`, doesn't reach reviewBooking or payment. Active debugging in [TASKS.md](TASKS.md). |
-| Aadhaar OTP (Tatkal-mandatory) | ❌ **Not handled** — blocks verified live Tatkal booking |
-| End-to-end confirmed PNR | ❌ Not yet achieved in any quota |
-| Anti-bot detection | 🟡 Basic (real headed Chromium); IRCTC actively blocks automation |
-| Selector stability | 🟡 Tuned to IRCTC's mid-2025 DOM; may need updates when the site changes |
-| WhatsApp remote hand-off | 🟡 Components exist but not wired end-to-end |
-| Web form privacy | 🟡 Server-side encryption — prefer CLI/interactive |
-| Login, search, form pre-fill | ✅ Verified working live (GENERAL quota) |
-
-The full, prioritized backlog and the stress-test findings live in **[TASKS.md](TASKS.md)**.
-
----
-
 ## ⚖️ Legal
 
 This software is provided for **personal and educational use only**. Automated booking
