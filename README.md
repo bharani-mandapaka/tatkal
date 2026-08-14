@@ -17,17 +17,25 @@ your browser, as your own IRCTC session.**
   tool.** It automates the booking *flow*; it does not guarantee a confirmed ticket.
 - **IRCTC's Terms of Service prohibit automated booking.** You use this on your own
   account, at your own risk. Don't run it as a service or for other people.
-- **Aadhaar OTP is mandatory for all Tatkal bookings (since July 2025) and is _not yet
-  automated_ here.** A live Tatkal run will reach a point where IRCTC requires an
-  Aadhaar OTP that this agent does not yet handle. Treat live Tatkal booking as
-  **experimental / not verified end-to-end.**
+- **Automated login is currently blocked by IRCTC's bot detection** (Akamai — confirmed
+  live, HTTP 510 on the auth request). The agent now defaults to a **manual-login
+  hand-off**: you log in yourself in the visible browser window, and the agent verifies
+  and takes over from there. Set `manual_login: true` (the recommended default) when
+  collecting your config.
+- **Aadhaar OTP is mandatory for all Tatkal bookings (since July 2025).** A hand-off
+  exists (you enter the OTP yourself when the agent detects the prompt and pauses), but
+  it has **never been seen against a real Tatkal window** — only GENERAL quota (which
+  doesn't require it) has been live-tested. Treat live Tatkal booking as
+  **experimental / not verified end-to-end** until a real rehearsal confirms it.
 - **No confirmed PNR has been produced yet, in any quota.** Current status against live
   IRCTC (**GENERAL quota**, dry-run mode):
   - ✅ Verified working: login, the welcome/language modal, form pre-fill, and search
     (reliably reaching live results).
   - ❌ **Currently broken — the active blocker:** after filling passenger details, the
     flow gets stuck on the passenger-details page (`/booking/psgninput`) and does not
-    yet reach the review or payment page.
+    yet reach the review or payment page. A likely-cause fix has been applied (an
+    insurance-decline field that could fail to select silently) but is **not yet
+    live-verified**.
   - See [TASKS.md](TASKS.md) for the live debugging log and root-cause notes.
 - Always keep a human watching the run. The agent is an assistant, not an autopilot.
 
