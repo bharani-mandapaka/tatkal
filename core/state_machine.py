@@ -13,6 +13,7 @@ class BookingState(Enum):
     SELECTING_TRAIN = auto()
     FILLING_PASSENGERS = auto()
     SOLVING_CAPTCHA = auto()
+    AWAITING_AADHAAR_OTP = auto()
     SUBMITTING = auto()
     PAYING = auto()
     CONFIRMED = auto()

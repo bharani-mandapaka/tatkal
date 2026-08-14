@@ -29,7 +29,7 @@ def cmd_collect() -> None:
 def cmd_check() -> None:
     import questionary
     from config import config_exists, load_config
-    from scheduler import calculate_booking_times, get_ntp_offset
+    from scheduler import calculate_booking_times, get_ntp_offset, now_ist
 
     print("\nTatkal Agent — Pre-run Check")
     print("─" * 35)
@@ -81,12 +81,12 @@ def cmd_check() -> None:
 
     config = _build_config(raw)
     login_time, window_time = calculate_booking_times(config)
-    remaining = window_time - datetime.now()
+    remaining = window_time - now_ist()
     hours = int(remaining.total_seconds() // 3600)
     mins = int((remaining.total_seconds() % 3600) // 60)
 
-    print(f"Booking window      {window_time.strftime('%H:%M:%S')} · {window_time.strftime('%d %b %Y')}")
-    print(f"Login fires at      {login_time.strftime('%H:%M:%S')}")
+    print(f"Booking window      {window_time.strftime('%H:%M:%S')} IST · {window_time.strftime('%d %b %Y')}")
+    print(f"Login fires at      {login_time.strftime('%H:%M:%S')} IST")
     print(f"Time until login    {hours}h {mins:02d}m")
 
     if problems:
@@ -104,7 +104,7 @@ def cmd_check() -> None:
 async def cmd_run() -> None:
     import questionary
     from config import config_exists, load_config
-    from scheduler import calculate_booking_times, wait_until
+    from scheduler import calculate_booking_times, wait_until, now_ist
     from adapters.browser import PlaywrightBrowser
     from adapters.captcha_twocaptcha import TwoCaptchaAdapter
     from adapters.captcha_manual import ManualCaptchaAdapter
@@ -146,8 +146,8 @@ async def cmd_run() -> None:
     await browser.launch()
     try:
         # Wait until login time if we're early
-        if datetime.now() < login_time:
-            remaining = (login_time - datetime.now()).total_seconds()
+        if now_ist() < login_time:
+            remaining = (login_time - now_ist()).total_seconds()
             log.info("waiting",
                      target=login_time.strftime("%H:%M:%S"),
                      remaining_min=f"{remaining / 60:.1f}")
@@ -209,6 +209,7 @@ def _build_config(raw: dict):
         book_only_if_confirmed=raw.get("book_only_if_confirmed", True),
         captcha_api_key=raw.get("captcha_api_key"),
         quota=raw.get("quota", "TATKAL"),
+        manual_login=raw.get("manual_login", False),
     )
 
 

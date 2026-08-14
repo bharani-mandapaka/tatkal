@@ -121,6 +121,11 @@ class BookingConfig:
     payment: Optional[PaymentConfig] = None
     boarding_point: Optional[str] = None
     book_only_if_confirmed: bool = True
+    # Automated login can get blocked by IRCTC's anti-bot detection at the
+    # auth endpoint (confirmed live 2026-08-14). When True, a human logs in
+    # themselves in the browser window instead of the agent typing
+    # username/password. `password` may be left empty when this is set.
+    manual_login: bool = False
     captcha_api_key: Optional[str] = None
     quota: str = "TATKAL"  # "TATKAL", "PREMIUM TATKAL", "GENERAL", "LADIES", etc.
 

@@ -26,6 +26,7 @@ from logger import setup_logging, get_logger
 from core.gather_info import gather_info_interactive
 from adapters.browser import PlaywrightBrowser
 from adapters.notifier import Notifier
+from scheduler import now_ist
 
 log = get_logger()
 
@@ -42,8 +43,9 @@ def _build_captcha_adapter(config):
 
 
 def _window_datetime(config, override: time | None) -> datetime:
-    """Compute the booking window datetime from today's date."""
-    now = datetime.now()
+    """Compute the booking window datetime from today's IST date — anchored to
+    IST regardless of the machine's own timezone configuration."""
+    now = now_ist()
     if override:
         return now.replace(
             hour=override.hour, minute=override.minute,
@@ -66,8 +68,8 @@ async def main() -> None:
 
     window_time = _window_datetime(config, window_override)
 
-    print(f"\n  Window opens at: {window_time.strftime('%H:%M:%S')} today")
-    if window_time <= datetime.now():
+    print(f"\n  Window opens at: {window_time.strftime('%H:%M:%S')} IST today")
+    if window_time <= now_ist():
         print("  (Window is in the past — firing immediately for testing)")
 
     from adapters.captcha_file import FileCaptchaAdapter

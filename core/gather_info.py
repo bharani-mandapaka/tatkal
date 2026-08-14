@@ -282,7 +282,13 @@ def gather_info_interactive() -> tuple[BookingConfig, time | None]:
 
     print("━━━ IRCTC Credentials ━━━")
     username = _ask("Username")
-    password = _ask_secret("Password")
+    manual_login = _ask_yn(
+        "Log in yourself when the browser opens, instead of the agent typing "
+        "your password? (Recommended — automated login can get blocked by "
+        "IRCTC's bot detection)",
+        default=True,
+    )
+    password = "" if manual_login else _ask_secret("Password")
 
     journey = _gather_journey()
     classes = _gather_class_priority()
@@ -318,6 +324,7 @@ def gather_info_interactive() -> tuple[BookingConfig, time | None]:
         payment=payment,
         class_priority=classes,
         thresholds=thresholds,
+        manual_login=manual_login,
     )
 
     _print_summary(config, window_time_override)
@@ -337,6 +344,7 @@ def _print_summary(config: BookingConfig, window_time: time | None) -> None:
     print("\n" + "━" * 45)
     print("  BOOKING SUMMARY")
     print("━" * 45)
+    print(f"  Login    {'Manual (you log in yourself)' if config.manual_login else 'Automated'}")
     print(f"  Train    {config.train_number}  {config.from_station} → {config.to_station}")
     print(f"  Date     {config.journey_date}  Quota: {config.quota}")
     print(f"  Classes  {' → '.join(config.class_priority)} (tries in order)")

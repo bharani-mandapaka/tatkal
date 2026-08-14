@@ -48,6 +48,71 @@ on psgninput hasn't been confirmed. Need to:
 
 ---
 
+## Overnight Fix Pass 🌙 (2026-08-14, ~23:00–00:30 IST)
+
+Worked everything reachable **without a live IRCTC session** — deliberately did NOT
+attempt a live run tonight: automated login is confirmed blocked (Akamai, HTTP 510)
+and re-trying it unsupervised risks flagging the real account further before Monday;
+`login_manual()` blocks on human `input()` which nobody was here to give. Everything
+below is code + tests only, unverified live. **130/130 tests pass** (was 121; +9 new).
+
+### Submit→payment blocker — best-effort fix, NOT yet live-verified
+Root-caused by code review (no new live diagnostic data exists yet — the diag
+added earlier this session was never actually exercised). Leading suspect:
+the **Travel Insurance decline radio** (`fill_passenger_details` in `browser.py`)
+had narrow, speculative selectors and **failed completely silently** if none
+matched — no warning logged, nothing. If that field is required by IRCTC's
+Angular reactive form, an unset radio would leave the form permanently invalid
+and Continue would just... never enable. No error, no crash — exactly the
+"stuck on psgninput" symptom logged on 2026-06-22.
+- [x] **Insurance-decline now logs a warning if nothing matched** (was silent)
+  and has a scoped JS fallback (finds the section whose text mentions
+  "insurance", clicks the option inside it whose own text is "No") — replaces
+  the old `:right-of(:text('No'))` selector, which could latch onto an
+  unrelated "No" elsewhere on the page (e.g. berth "No Preference").
+- [x] Continue/Proceed button click now does an explicit `scroll_into_view_if_needed`
+  first, matching the pattern already needed for the confirm-berths checkbox.
+- [ ] **Still needs a live run to confirm.** If insurance-decline wasn't
+  actually the cause, the new warning log will at least tell us that
+  definitively next time, instead of a silent no-op.
+
+### Aadhaar OTP hand-off — built (task #5), NOT yet live-verified
+- [x] `BookingState.AWAITING_AADHAAR_OTP` added.
+- [x] `BrowserPort.handle_aadhaar_otp_if_present()` — new abstract method.
+- [x] `PlaywrightBrowser` impl: broad heuristic (OTP-shaped input OR page text
+  mentioning both "Aadhaar"/"Aadhar" and "OTP"), screenshots
+  (`step_aadhaar_otp.png`), pauses for a human to enter the OTP directly in
+  the browser (same hand-off shape as `login_manual()`). Returns `False`
+  near-instantly when absent so it doesn't cost time on every run.
+- [x] Wired into `booking_flow.py` at **two** checkpoints — after CAPTCHA-solving
+  and after submit — since nobody has seen this screen live yet and its real
+  position in the flow is still unknown. Both checks are cheap no-ops today.
+- [x] 3 new tests (`test_irctc_platform.py`): both checkpoints get called;
+  prompt-present doesn't abort the flow; prompt-absent is unaffected (regression guard).
+- [ ] **Still the single highest-risk unknown.** This is a best-effort net,
+  not a confirmed fix — task #6 (live rehearsal) is what actually resolves this.
+
+### Payment — test coverage added (was zero)
+- [x] `tests/test_payment.py` — 6 new tests: UPI/e-wallet/card happy paths,
+  card OTP prompt, unknown-method `ValueError`, and the one that matters most:
+  **`config.clear_sensitive()` fires even when a payment step raises mid-flight**
+  (verified directly, not just implied by the happy-path tests) — CVV/MPIN/card
+  number must never survive in memory past a failed payment attempt.
+
+### Explicitly NOT attempted tonight (needs a human or live data, not just code review)
+- Double-book / idempotency guard ("check My Bookings before re-submitting") —
+  still open. Didn't blind-guess the "My Bookings" page DOM; a wrong guess here
+  (false "already booked" positive, or a false negative that allows a real
+  double-charge) would be worse than leaving it as a known gap.
+- Client-side (Web Crypto) encryption for the Vercel web form — real fix, but
+  too large to build+verify blind overnight. Operational workaround still
+  stands: **have the friend run the CLI locally**, not the hosted web form, so
+  credentials never leave their machine.
+- Live TATKAL rehearsal (#6) and friend's-machine prep (#7) — need a human and/or
+  a live Tatkal window; unchanged, still queued for the weekend.
+
+---
+
 ## Planned 📋 (from approved workflow redesign)
 
 ### Stage 1 — Interactive gather-info (replace encrypted config)
@@ -240,6 +305,69 @@ intelligence + WhatsApp HITL where we already lead; avoid the anti-ban arms race
 - [ ] Fingerprint/anti-ban as a core feature — unwinnable treadmill.
 - [ ] `admin_phone` shared-service mode — highest ToS/legal risk; cut it (also listed 🟡).
 - [ ] Millisecond form-fill micro-optimization — human OTP latency dwarfs it.
+
+---
+
+## Competitive Analysis — OSS Deep Dive 🔍 (2026-08-14)
+
+Follow-up to the 2026-06-18 pass, triggered by tonight's live finding (automated
+login blocked with HTTP 510) and the pivot to `login_manual()`. This round went
+deeper on GitHub-hosted OSS specifically and on what IRCTC's anti-bot system
+actually is. **Bottom line: nothing here changes the plan for Monday — it
+confirms the manual-login pivot was the right call and tells us where NOT to
+spend the next 3 days.**
+
+### 🔑 Headline finding: IRCTC's WAF is Akamai Bot Manager
+Confirmed via PIB press coverage — Railways' anti-bot stack is Akamai Bot Manager
++ a major CDN, blocking **60+ billion malicious requests in 6 months** and
+mitigating **~64% of Tatkal-window traffic**, with bot traffic hitting **~50% of
+all login attempts in the first 5 minutes** of the window. This is what returned
+our HTTP 510 tonight.
+**Why it matters:** Akamai Bot Manager fingerprints TLS/JA3, device sensors, and
+behavioral timing — not just `navigator.webdriver`. `playwright-stealth` (the
+"light anti-detection" item in the 06-18 analysis) only patches JS-level tells
+and would **not** have prevented tonight's block. **Downgrade/drop that item —
+it's not worth the time before Monday, and probably not worth it ever** for a
+solo project against enterprise-grade bot management. This validates (not just
+excuses) the `login_manual()` pivot: it isn't a workaround for a bug, it's the
+correct architecture given what IRCTC actually runs.
+
+### 🔑 Aadhaar OTP: confirmed nobody has solved this in public
+Checked every OSS Tatkal repo turned up by search — ArpanMajumdar, Prajinkya
+Pimpalghare, the-vishal, nashit8421, praneetk2704, shivamguys, dpak-maurya,
+mani90, SuneetPatil, sriharshaarangi, DheerendraTomar, suryaansh2002. **All
+predate the July 2025 Aadhaar-OTP mandate; none handle it.** This isn't a gap
+we're behind on — it's genuinely unmapped ground, same as everyone else.
+Practical takeaway: there's no reference implementation to crib from, so task
+**#6 (live rehearsal to observe the OTP screen) is the single highest-value
+unknown left** — no shortcut exists, it has to be observed directly.
+
+One adjacent pattern worth noting (not adopting this week): SuneetPatil's repo
+auto-reads a **login OTP** (the CAPTCHA-alternative one, not Aadhaar) from Gmail
+via IMAP, using Windows Credential Manager for the mailbox creds. Architecturally
+transferable to Aadhaar OTP *if* it ever lands somewhere automatable (SMS
+forwarding, ADB bridge) — but that's a v2 idea, not buildable+testable safely in
+2 days. Keep task #5 scoped to a simple terminal/console hand-off for Monday.
+
+### 🟩 Low-risk speed tips worth folding into the runbook (from tatkal-software/community sources, not code changes)
+- [ ] Have the friend's `login_time` fire **10–15 min before** the window (not
+  right at it) and hold on the search page — matches what the agent already
+  does via `calculate_booking_times`, just confirm the lead time is generous.
+- [ ] Confirm `payment.method` is **UPI**, not net banking — community consensus
+  is UPI/card clears fastest under load.
+- [ ] Runbook should tell the friend to keep a **second manual browser tab**
+  logged in as a human backup, since `manual_login` is now the primary path
+  anyway and the agent has zero confirmed live PNRs yet.
+- [ ] Re-confirm clock sync (`main.py check`) in the minutes right before the
+  window, not just once earlier in the day.
+
+### What this changes vs. the 06-18 analysis
+- **Drop/deprioritize:** `playwright-stealth` / anti-fingerprint work — confirmed
+  low ROI against Akamai specifically.
+- **Reinforced, not changed:** "fast human-assist booker" positioning, Aadhaar
+  OTP as the existential blocker, avoiding the anti-ban arms race entirely.
+- **No new blockers found** — the critical path is still #2 → #4 → #5/#6 → #7 → #8,
+  unchanged by this research.
 
 ---
 

@@ -22,8 +22,13 @@ log = get_logger()
 IRCTC_HOME = "https://www.irctc.co.in/nget/train-search"
 COOKIE_PATH = Path("session.json")
 
-# Human-like typing delay range (ms)
-_TYPE_DELAY = 40
+# Per-character delay (ms) for keyboard.type() — needed so Angular's zone.js
+# sees a real keydown/input event per character (fill() can skip its change
+# detection), NOT to imitate human typing speed. Kept low since it's pure
+# overhead on the automated-login fallback path (login_manual is now the
+# recommended default) and on every passenger-field fill during the live
+# window scramble.
+_TYPE_DELAY = 15
 
 
 def _mask(s: str) -> str:
@@ -54,13 +59,13 @@ class PlaywrightBrowser(BrowserPort):
             headless=False,
             args=["--start-maximized"],
         )
+        # No user_agent override: a hardcoded UA string drifts out of sync
+        # with the actual bundled Chromium version over time (was pinned to
+        # Chrome/124 while the real installed build is 148) — a UA/fingerprint
+        # mismatch is exactly the kind of signal anti-bot detection looks for.
+        # Let Chromium send its own naturally-consistent default UA instead.
         self._context = await self._browser.new_context(
             viewport={"width": 1366, "height": 768},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
         )
         if COOKIE_PATH.exists():
             try:
@@ -87,16 +92,18 @@ class PlaywrightBrowser(BrowserPort):
         Click 'English' to proceed — NEVER 'Authenticate now' (that starts the
         Aadhaar flow). Falls back to a generic close button. Safe no-op if absent.
         """
+        # wait_for() actively polls up to the timeout instead of doing an
+        # instant, possibly-premature check — this is what lets the caller's
+        # preceding page-load wait be removed rather than just shortened.
         try:
             english = self.page.locator(
                 "button:has-text('English'), a:has-text('English'), "
                 ".btn:has-text('English'), [class*='lang']:has-text('English')"
             ).first
-            if await english.count() > 0 and await english.is_visible(timeout=2_000):
-                await english.click()
-                log.info("welcome_modal_english_selected")
-                await asyncio.sleep(0.5)
-                return
+            await english.wait_for(state="visible", timeout=2_500)
+            await english.click()
+            log.info("welcome_modal_english_selected")
+            return
         except Exception as e:
             log.debug("welcome_modal_english_skip", note=str(e)[:60])
 
@@ -106,10 +113,9 @@ class PlaywrightBrowser(BrowserPort):
                 ".modal-close, button.close, .ui-dialog-titlebar-close, "
                 "button[aria-label='Close']"
             ).first
-            if await close_btn.count() > 0 and await close_btn.is_visible():
-                await close_btn.click()
-                log.info("welcome_modal_closed_generic")
-                await asyncio.sleep(0.3)
+            await close_btn.wait_for(state="visible", timeout=1_000)
+            await close_btn.click()
+            log.info("welcome_modal_closed_generic")
         except Exception:
             pass
 
@@ -117,9 +123,9 @@ class PlaywrightBrowser(BrowserPort):
 
     async def login(self, username: str, password: str) -> bool:
         # "networkidle" never fires on IRCTC (persistent WebSocket keep-alives).
-        # "load" waits for window.onload — reliable and fast.
-        await self.page.goto(IRCTC_HOME, wait_until="load")
-        await asyncio.sleep(2)   # React hydration
+        # "load" waits for window.onload — reliable and fast. No blind hydration
+        # sleep here: _dismiss_welcome_modal() below actively waits for its own
+        # elements instead, so it absorbs whatever hydration delay exists.
 
         # Fresh sessions show a Welcome modal (Aadhaar alert + language choice).
         # Pick English and dismiss it before anything else.
@@ -176,6 +182,22 @@ class PlaywrightBrowser(BrowserPort):
             print("  Solve the login CAPTCHA in the browser, then press Enter.")
             input("  Press Enter after solving the captcha: ")
 
+        # DIAG: capture the actual login-related network response(s) so a
+        # failure shows IRCTC's real server-side reason instead of a guess.
+        _login_responses: list[dict] = []
+
+        async def _capture_login_response(response) -> None:
+            url = response.url.lower()
+            if any(k in url for k in ("login", "auth", "signin")):
+                try:
+                    body = await response.text()
+                except Exception:
+                    body = "<unreadable>"
+                _login_responses.append(
+                    {"url": response.url, "status": response.status, "body": body[:500]}
+                )
+
+        self.page.on("response", _capture_login_response)
         await self.page.locator("button[type='submit']:has-text('SIGN IN'), button:has-text('Login')").first.click()
 
         try:
@@ -207,6 +229,7 @@ class PlaywrightBrowser(BrowserPort):
                     };
                 }"""
             )
+            self.page.remove_listener("response", _capture_login_response)
             try:
                 await self.page.screenshot(path="step_after_login.png")
             except Exception:
@@ -235,6 +258,13 @@ class PlaywrightBrowser(BrowserPort):
                 await self.page.screenshot(path="step_login_timeout.png")
             except Exception:
                 pass
+            self.page.remove_listener("response", _capture_login_response)
+            for r in _login_responses:
+                log.warning("login_response_diag", url=r["url"], status=r["status"], body=r["body"])
+                print(f"  [login diag] {r['status']} {r['url']}")
+                print(f"  [login diag] body: {r['body']}")
+            if not _login_responses:
+                print("  [login diag] no login/auth-matching network response captured")
             if await self.page.locator(_captcha_sel).count() > 0:
                 print("\n  ── Login CAPTCHA (appeared after submit) ──────────────")
                 print("  Solve the CAPTCHA in the browser, then press Enter.")
@@ -256,6 +286,37 @@ class PlaywrightBrowser(BrowserPort):
             else:
                 log.error("login_failed", error=str(e))
             return False
+
+    async def login_manual(self) -> bool:
+        # Automated login was confirmed blocked live (2026-08-14): IRCTC's
+        # WAF returned HTTP 510 "Unable to Process Request" on the automated
+        # auth POST while a manual login from the same machine succeeded
+        # moments earlier. A real human driving the login sidesteps whatever
+        # signal is triggering that block.
+        await self.page.goto(IRCTC_HOME, wait_until="load")
+        # No blind hydration sleep — _dismiss_welcome_modal() actively waits
+        # for its own elements, absorbing whatever hydration delay exists.
+        await self._dismiss_welcome_modal()
+
+        if await self.is_logged_in():
+            log.info("login_manual_session_reused")
+            return True
+
+        print("\n  ── Manual login required ──────────────────────────────────")
+        print("  Automated login is being blocked by IRCTC's bot detection.")
+        print("  Please log in yourself in the browser window that just opened.")
+        input("  Press Enter here once you're logged in: ")
+
+        # No settle sleep — is_logged_in() already retries internally
+        # (12x 0.5s) specifically to absorb this kind of just-happened render.
+        if await self.is_logged_in():
+            cookies = await self._context.cookies()
+            COOKIE_PATH.write_text(json.dumps(cookies), encoding="utf-8")
+            log.info("login_manual_success")
+            return True
+
+        log.warning("login_manual_not_detected")
+        return False
 
     async def is_logged_in(self) -> bool:
         # Retry up to 12× with 0.5 s backoff (6 s total).  Angular mid-render
@@ -368,11 +429,11 @@ class PlaywrightBrowser(BrowserPort):
             )
             await inp.click()
             await inp.fill(code)
-            await asyncio.sleep(0.7)   # allow suggestion list to appear
+            # wait_for already waits for the suggestion to appear — no need
+            # for a blind sleep first.
             suggestion = self.page.locator("li.ui-autocomplete-list-item").first
             await suggestion.wait_for(timeout=8_000)
             await suggestion.click()
-            await asyncio.sleep(0.3)
 
         await fill_station("origin", config.from_station)
         await fill_station("destination", config.to_station)
@@ -388,7 +449,7 @@ class PlaywrightBrowser(BrowserPort):
             await date_input.click()
             await asyncio.sleep(0.3)
             await date_input.press("Control+a")
-            await self.page.keyboard.type(journey_date_fmt, delay=80)
+            await self.page.keyboard.type(journey_date_fmt, delay=_TYPE_DELAY)
             await asyncio.sleep(0.5)
             await self.page.keyboard.press("Tab")    # commit + close calendar popup
             await asyncio.sleep(0.5)
@@ -486,7 +547,19 @@ class PlaywrightBrowser(BrowserPort):
                 await self.page.wait_for_selector(
                     "app-train-avl-enq", timeout=20_000, state="attached"
                 )
-                await asyncio.sleep(3)   # let train rows fully render
+                # Poll for real content instead of a blind fixed wait — the
+                # element can be attached before Angular has actually
+                # rendered train rows into it. Resolves as soon as content
+                # shows up (usually well under 1s), 2.5s safety cap instead
+                # of always paying a flat 3s.
+                for _ in range(25):
+                    has_content = await self.page.evaluate(
+                        "() => document.querySelector('app-train-avl-enq')"
+                        ".textContent.trim().length > 20"
+                    )
+                    if has_content:
+                        break
+                    await asyncio.sleep(0.1)
                 log.info("train_list_loaded", attempt=attempt)
                 return
             except Exception:
@@ -608,8 +681,8 @@ class PlaywrightBrowser(BrowserPort):
         # ASCII-safe — Windows console charmap can't encode checkmark/middot
         print(f"  [OK] {train_number} {travel_class} | {avail_text} -- booking now")
 
-        await asyncio.sleep(0.5)
-
+        # wait_for() already waits for the button to appear — no need for a
+        # blind sleep beforehand.
         book_btn = self.page.locator("button:has-text('Book Now')").first
         await book_btn.wait_for(timeout=8_000)
         await book_btn.click()
@@ -700,7 +773,7 @@ class PlaywrightBrowser(BrowserPort):
         await self.page.wait_for_selector(
             "app-train-avl-enq", timeout=15_000, state="attached"
         )
-        await asyncio.sleep(1)  # Let Angular finish hydrating
+        await asyncio.sleep(0.5)  # Let Angular finish hydrating
 
         # Screenshot at start of intermediate page
         try:
@@ -735,7 +808,7 @@ class PlaywrightBrowser(BrowserPort):
             log.warning("booking_train_list_sl_anchor_failed", error=str(e))
             print(f"  [booking/train-list] SL anchor click failed: {e}")
 
-        await asyncio.sleep(0.5)  # let Angular process the click
+        await asyncio.sleep(0.3)  # let Angular process the click
 
         # ── Detect Tatkal ARP / date errors ─────────────────────────────────
         # Clicking the class on a Tatkal date outside the Advance Reservation
@@ -851,11 +924,15 @@ class PlaywrightBrowser(BrowserPort):
             log.warning("booking_train_list_date_parse_failed",
                         journey_date=config.journey_date)
 
-        # ── Poll until 'disable-book' is gone (up to 5 s) ───────────────────
+        # ── Poll until 'disable-book' is gone (up to ~5 s) ───────────────────
+        # Check immediately (don't pay a fixed delay before the first look),
+        # then poll every 0.2s instead of 0.5s — same worst-case budget,
+        # converges much faster in the common case where it's already enabled.
         book_now_enabled = False
         last_bn_state = None
-        for attempt in range(10):
-            await asyncio.sleep(0.5)
+        for attempt in range(25):
+            if attempt > 0:
+                await asyncio.sleep(0.2)
             try:
                 bn_state = await self.page.evaluate(f"""() => {{
                     const cards = document.querySelectorAll('app-train-avl-enq');
@@ -924,8 +1001,8 @@ class PlaywrightBrowser(BrowserPort):
             log.warning("booking_train_list_book_now_failed", error=str(e))
             print(f"  [booking/train-list] Book Now click failed: {e}")
 
-        # Screenshot immediately after Book Now click
-        await asyncio.sleep(0.5)
+        # Screenshot immediately after Book Now click — debug artifact only,
+        # doesn't need to gate the flow.
         try:
             await self.page.screenshot(path="step_booking_train_list_after_bn.png")
             print("  [snap] step_booking_train_list_after_bn.png")
@@ -934,19 +1011,20 @@ class PlaywrightBrowser(BrowserPort):
 
         # ── Handle IRCTC Confirmation dialog (station-code mismatch warning) ──
         # IRCTC sometimes shows: "You searched from MAS but booking from MS to CGL.
-        # Do you want to continue?" — we must click 'Yes' to proceed.
-        await asyncio.sleep(1)
+        # Do you want to continue?" — we must click 'Yes' to proceed. This is
+        # conditional (usually does NOT appear), so use a short wait_for rather
+        # than a long one — a long timeout would cost real seconds on every
+        # run in the common case where there's nothing to dismiss.
         try:
             yes_btn = self.page.locator(
                 "button:has-text('Yes'), "
                 ".modal-footer button:has-text('OK'), "
                 "button.btn-primary:has-text('Yes')"
             ).first
-            if await yes_btn.count() > 0 and await yes_btn.is_visible(timeout=2_000):
-                await yes_btn.click()
-                log.info("booking_train_list_confirmation_yes_clicked")
-                print("  [booking/train-list] Confirmation dialog → clicked Yes")
-                await asyncio.sleep(0.5)
+            await yes_btn.wait_for(state="visible", timeout=800)
+            await yes_btn.click()
+            log.info("booking_train_list_confirmation_yes_clicked")
+            print("  [booking/train-list] Confirmation dialog → clicked Yes")
         except Exception as e:
             log.debug("booking_train_list_no_confirmation_dialog", note=str(e)[:60])
 
@@ -964,17 +1042,17 @@ class PlaywrightBrowser(BrowserPort):
             except Exception:
                 pass
 
-        # Dismiss insurance / travel-protection popup if it appears
-        await asyncio.sleep(0.5)
+        # Dismiss insurance / travel-protection popup if it appears — also
+        # conditional, short wait_for for the same reason as above.
         try:
             insurance_skip = self.page.locator(
                 "button:has-text('Skip'), "
                 "button:has-text('No Thanks'), "
                 "button:has-text('Continue without insurance')"
             ).first
-            if await insurance_skip.count() > 0 and await insurance_skip.is_visible():
-                await insurance_skip.click()
-                log.info("insurance_popup_dismissed")
+            await insurance_skip.wait_for(state="visible", timeout=600)
+            await insurance_skip.click()
+            log.info("insurance_popup_dismissed")
         except Exception:
             pass
 
@@ -1087,7 +1165,7 @@ class PlaywrightBrowser(BrowserPort):
                     if await loc.count() > 0:
                         await loc.click(timeout=2_000)
                         await loc.fill("", timeout=1_000)   # clear first
-                        await self.page.keyboard.type(pax.name, delay=50)
+                        await self.page.keyboard.type(pax.name, delay=_TYPE_DELAY)
                         await self.page.keyboard.press("Tab")
                         log.info("fill_name_ok", pax=i, sel=name_sel)
                         name_filled = True
@@ -1110,7 +1188,7 @@ class PlaywrightBrowser(BrowserPort):
                     if await loc.count() > 0:
                         await loc.click(timeout=2_000)
                         await loc.fill("", timeout=1_000)
-                        await self.page.keyboard.type(str(pax.age), delay=50)
+                        await self.page.keyboard.type(str(pax.age), delay=_TYPE_DELAY)
                         await self.page.keyboard.press("Tab")
                         log.info("fill_age_ok", pax=i, sel=age_sel)
                         age_filled = True
@@ -1120,7 +1198,7 @@ class PlaywrightBrowser(BrowserPort):
             if not age_filled:
                 log.warning("fill_age_failed", pax=i)
 
-            await asyncio.sleep(0.5)  # let Angular process name+age before dropdowns
+            await asyncio.sleep(0.3)  # let Angular process name+age before dropdowns
 
             # Display-name mappings: IRCTC stores short codes but some pages show
             # full English names in the dropdown.  Try both.
@@ -1435,20 +1513,62 @@ class PlaywrightBrowser(BrowserPort):
                     log.warning("confirm_berths_fallback_failed", err=str(exc)[:80])
 
         # ── Decline Travel Insurance (inline Yes/No radio on psgninput) ───────
-        # IRCTC shows "Travel Insurance — Yes / No" (₹0.45/pax). It's an inline
-        # PrimeNG radio, NOT a popup. Select "No" so the required field is set.
+        # IRCTC shows "Travel Insurance — Yes / No" (₹0.45/pax) as an inline
+        # PrimeNG radio, NOT a popup (video-confirmed). If this is a required
+        # field and we fail to select "No", Angular's reactive form silently
+        # stays invalid and the Continue button never enables — the leading
+        # suspect for the psgninput submit blocker, since the original
+        # selector left no diagnostic trail when it didn't match anything.
+        insurance_declined = False
         try:
-            no_ins = self.page.locator(
+            no_label = self.page.locator(
                 "label:has-text(\"don't want\"), "
-                "label:has-text('No, I don'), "
-                "p-radiobutton:right-of(:text('No'))"
+                "label:has-text('No, I don')"
             ).first
-            if await no_ins.count() > 0:
-                await no_ins.scroll_into_view_if_needed()
-                await no_ins.click()
-                log.info("insurance_declined")
+            if await no_label.count() > 0:
+                await no_label.scroll_into_view_if_needed()
+                await no_label.click()
+                insurance_declined = True
         except Exception as exc:
-            log.debug("insurance_decline_skip", note=str(exc)[:60])
+            log.debug("insurance_decline_label_failed", note=str(exc)[:60])
+
+        if not insurance_declined:
+            # JS fallback: locate the section whose text mentions "insurance",
+            # then click the option INSIDE that section whose own text is
+            # just "No" — scoped this way instead of the old page-wide
+            # `:right-of(:text('No'))`, which could latch onto an unrelated
+            # "No" elsewhere on the page (e.g. berth "No Preference").
+            try:
+                insurance_declined = await self.page.evaluate("""() => {
+                    const all = Array.from(document.querySelectorAll('*'));
+                    const section = all.find(el =>
+                        /insurance/i.test(el.textContent || '') &&
+                        el.children.length > 0 && el.children.length < 30
+                    );
+                    if (!section) return false;
+                    const opts = Array.from(
+                        section.querySelectorAll('label, p-radiobutton, [class*="radio"]')
+                    );
+                    const noOpt = opts.find(el => {
+                        const t = (el.textContent || '').trim();
+                        return /^no\\b/i.test(t) && t.length < 20;
+                    });
+                    if (!noOpt) return false;
+                    noOpt.scrollIntoView({behavior: 'instant', block: 'center'});
+                    noOpt.click();
+                    return true;
+                }""")
+            except Exception as exc:
+                log.warning("insurance_decline_js_failed", err=str(exc)[:80])
+
+        if insurance_declined:
+            log.info("insurance_declined")
+        else:
+            log.warning(
+                "insurance_decline_not_found",
+                note="no insurance radio matched — if this field is "
+                     "required, Continue will silently stay disabled",
+            )
 
         # ── Select payment mode (radio on psgninput, BEFORE Continue) ─────────
         # IRCTC routes payment via a coarse radio on the passenger page:
@@ -1598,6 +1718,10 @@ class PlaywrightBrowser(BrowserPort):
                     "button:has-text('Next')"
                 ).first
                 if await btn.count() > 0:
+                    # Explicit scroll before click — several other buttons/
+                    # checkboxes on this same long form needed this to avoid
+                    # a silent no-op click (see confirm-berths checkbox above).
+                    await btn.scroll_into_view_if_needed(timeout=2_000)
                     await btn.click(timeout=5_000)
                     return True
             except Exception as e:
@@ -1651,6 +1775,53 @@ class PlaywrightBrowser(BrowserPort):
             log.warning("payment_url_wait_timeout", url=self.page.url)
             raise
         log.info("passenger_form_submitted")
+
+    async def handle_aadhaar_otp_if_present(self) -> bool:
+        # Broad heuristic since the real DOM for this screen has never been
+        # observed live — every live-tested run so far has been GENERAL
+        # quota, which the July 2025 mandate doesn't apply to. Checks both
+        # a labelled OTP input and page text mentioning Aadhaar+OTP together
+        # so it has a chance of catching the prompt whichever page it
+        # actually lands on. Must stay cheap: this runs on every booking,
+        # and the common case (no prompt) needs to return near-instantly.
+        try:
+            detected = await self.page.evaluate("""() => {
+                const otpInput = document.querySelector(
+                    'input[formcontrolname*="otp" i], input[id*="otp" i], '
+                    + 'input[name*="otp" i], input[placeholder*="otp" i]'
+                );
+                const bodyText = document.body.innerText || '';
+                const mentionsAadhaarOtp =
+                    /aadhaar|aadhar/i.test(bodyText) && /otp/i.test(bodyText);
+                return !!otpInput || mentionsAadhaarOtp;
+            }""")
+        except Exception as exc:
+            log.debug("aadhaar_otp_check_failed", note=str(exc)[:60])
+            detected = False
+
+        if not detected:
+            return False
+
+        log.warning(
+            "aadhaar_otp_prompt_detected",
+            url=self.page.url,
+            note="pausing for human — exact flow position was unconfirmed "
+                 "until now, first live sighting",
+        )
+        try:
+            await self.page.screenshot(path="step_aadhaar_otp.png")
+            print("  [snap] step_aadhaar_otp.png")
+        except Exception:
+            pass
+
+        print("\n  ── Aadhaar OTP required ───────────────────────────────────")
+        print("  IRCTC is asking for the Aadhaar-linked OTP sent to the")
+        print("  registered mobile number. Enter it yourself in the browser")
+        print("  window, then come back here.")
+        input("  Press Enter once you've submitted the OTP and the page has moved on: ")
+
+        log.info("aadhaar_otp_handled", url=self.page.url)
+        return True
 
     async def get_booking_confirmation(self) -> dict:
         await self.page.wait_for_url("**/bookingConfirm**", timeout=300_000)

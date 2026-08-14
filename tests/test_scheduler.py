@@ -1,10 +1,10 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import pytest
 
 from core.models import BookingConfig, TravelClass, PaymentConfig, PaymentMethod
-from scheduler import calculate_booking_times, wait_until
+from scheduler import calculate_booking_times, wait_until, now_ist
 
 
 def _cfg(cls: TravelClass, date: str = "27-05-2026") -> BookingConfig:
@@ -49,21 +49,33 @@ def test_two_s_is_non_ac():
     assert window.hour == 11
 
 
+# ── Timezone-awareness (booking windows are IST regardless of machine tz) ──────
+
+def test_window_times_are_ist_aware():
+    login, window = calculate_booking_times(_cfg(TravelClass.TWO_A))
+    assert window.tzinfo is not None and window.utcoffset() == timedelta(hours=5, minutes=30)
+    assert login.tzinfo is not None and login.utcoffset() == timedelta(hours=5, minutes=30)
+
+
+def test_now_ist_matches_ist_offset():
+    assert now_ist().utcoffset() == timedelta(hours=5, minutes=30)
+
+
 # ── wait_until precision ───────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_wait_until_fires_within_tolerance():
-    target = datetime.now() + timedelta(milliseconds=500)
-    t0 = datetime.now()
+    target = now_ist() + timedelta(milliseconds=500)
+    t0 = now_ist()
     await wait_until(target)
-    elapsed = (datetime.now() - t0).total_seconds()
+    elapsed = (now_ist() - t0).total_seconds()
     assert 0.45 <= elapsed <= 0.75, f"Elapsed {elapsed:.3f}s — expected ~0.5s"
 
 
 @pytest.mark.asyncio
 async def test_wait_until_past_target_returns_immediately():
-    target = datetime.now() - timedelta(seconds=1)
-    t0 = datetime.now()
+    target = now_ist() - timedelta(seconds=1)
+    t0 = now_ist()
     await wait_until(target)
-    elapsed = (datetime.now() - t0).total_seconds()
+    elapsed = (now_ist() - t0).total_seconds()
     assert elapsed < 0.05, f"Should return instantly, took {elapsed:.3f}s"

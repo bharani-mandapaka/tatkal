@@ -11,8 +11,8 @@ Stop:
     Ctrl+C at any point — nothing is booked / charged until you approve payment.
 """
 import asyncio
+import os
 import sys
-from datetime import datetime
 
 sys.path.insert(0, ".")
 
@@ -22,11 +22,20 @@ from adapters.browser import PlaywrightBrowser
 from adapters.captcha_manual import ManualCaptchaAdapter
 from adapters.notifier import Notifier
 from core.booking_flow import BookingFlow
+from scheduler import now_ist
 from main import _build_config
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PASSPHRASE = "17644MAS"
+# Passphrase is read from the environment, never hardcoded — a prior version
+# of this file committed a real passphrase to git history. Treat that one as
+# burned; re-run `python main.py collect` with a fresh passphrase if you
+# haven't already.
+PASSPHRASE = os.environ.get("TATKAL_DEV_PASSPHRASE", "")
 DRY_RUN    = True    # Set to False when you want to do a real booking
+
+if not PASSPHRASE:
+    print("ERROR: Set TATKAL_DEV_PASSPHRASE env var before running (see .env.example)")
+    sys.exit(1)
 
 
 async def main() -> None:
@@ -65,7 +74,7 @@ async def main() -> None:
     flow     = BookingFlow(browser, captcha, None, notifier, dry_run=DRY_RUN)
 
     # Fire immediately — no waiting for Tatkal window
-    window_time = datetime.now()
+    window_time = now_ist()
 
     log.info("dry_run_start", train=config.train_number, quota=config.quota)
 

@@ -51,6 +51,7 @@ from adapters.browser import PlaywrightBrowser
 from adapters.captcha_file import FileCaptchaAdapter
 from adapters.notifier import Notifier
 from core.booking_flow import BookingFlow
+from scheduler import now_ist
 from main import _build_config
 
 PASSPHRASE = os.environ.get("TATKAL_DEV_PASSPHRASE", "")
@@ -101,7 +102,7 @@ async def main() -> None:
     browser  = PlaywrightBrowser()
     flow     = BookingFlow(browser, captcha, None, notifier, dry_run=DRY_RUN)
 
-    window_time = datetime.now()   # fire immediately
+    window_time = now_ist()   # fire immediately
 
     log.info("auto_dry_run_start", train=config.train_number, quota=config.quota)
 

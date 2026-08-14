@@ -2,11 +2,24 @@ import asyncio
 import socket
 import struct
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from core.models import BookingConfig
 
 # Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
 _NTP_UNIX_DELTA = 2208988800
+
+# Tatkal windows are defined in India Standard Time regardless of what
+# timezone the machine running this is configured for. datetime.now(IST)
+# gives the correct real-world IST instant off the system's UTC-based clock —
+# it does NOT trust the OS's configured local timezone the way a naive
+# datetime.now() comparison would, so a misconfigured machine clock (wrong
+# timezone, not just wrong time) can't silently fire the booking hours off.
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
 
 def get_ntp_offset(server: str = "pool.ntp.org", timeout: float = 3.0) -> float:
@@ -37,9 +50,10 @@ def get_ntp_offset(server: str = "pool.ntp.org", timeout: float = 3.0) -> float:
 
 
 def calculate_booking_times(config: BookingConfig) -> tuple[datetime, datetime]:
-    """Return (login_time, window_open_time) for the given config."""
+    """Return (login_time, window_open_time) for the given config, anchored to
+    IST regardless of the machine's own timezone configuration."""
     day, month, year = config.journey_date.split("-")
-    journey_dt = datetime(int(year), int(month), int(day))
+    journey_dt = datetime(int(year), int(month), int(day), tzinfo=IST)
     booking_date = journey_dt - timedelta(days=1)
 
     hour = 10 if config.is_ac_class else 11
@@ -49,9 +63,12 @@ def calculate_booking_times(config: BookingConfig) -> tuple[datetime, datetime]:
 
 
 async def wait_until(target: datetime) -> None:
-    """High-precision async wait — wakes every 100 ms in the final 10 seconds."""
+    """High-precision async wait — wakes every 100 ms in the final 10 seconds.
+
+    `target` must be timezone-aware (see calculate_booking_times) — compared
+    against the true IST instant, not the machine's local clock reading."""
     while True:
-        remaining = (target - datetime.now()).total_seconds()
+        remaining = (target - now_ist()).total_seconds()
         if remaining <= 0:
             return
         if remaining > 60:

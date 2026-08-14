@@ -9,6 +9,7 @@ from ports.browser_port import BrowserPort
 from ports.captcha_port import CaptchaPort
 from adapters.notifier import Notifier
 from payment import handle_payment
+from scheduler import now_ist
 from logger import get_logger
 
 log = get_logger()
@@ -64,7 +65,10 @@ class BookingFlow:
     async def _execute(self, config: BookingConfig, window_time: datetime) -> dict:
         # ── Login ──────────────────────────────────────────────────────────────
         self._transition(BookingState.LOGGING_IN)
-        success = await self.browser.login(config.username, config.password)
+        if config.manual_login:
+            success = await self.browser.login_manual()
+        else:
+            success = await self.browser.login(config.username, config.password)
         if not success:
             raise RuntimeError("Login failed — check credentials or solve login CAPTCHA")
 
@@ -126,9 +130,18 @@ class BookingFlow:
         self._transition(BookingState.SOLVING_CAPTCHA)
         await self._solve_captcha()
 
+        # ── Aadhaar OTP (mandatory for Tatkal since Jul 2025) ───────────────────
+        # Exact position in the flow is unconfirmed — GENERAL quota (the only
+        # path live-tested so far) never triggers it. Checked here and again
+        # after submit so whichever page it actually lands on gets caught;
+        # each check is a near-instant no-op when the prompt isn't present.
+        await self._handle_aadhaar_otp()
+
         # ── Submit form ────────────────────────────────────────────────────────
         self._transition(BookingState.SUBMITTING)
         await self.browser.submit_passenger_form()
+
+        await self._handle_aadhaar_otp()
 
         # ── Payment ────────────────────────────────────────────────────────────
         self._transition(BookingState.PAYING)
@@ -293,7 +306,10 @@ class BookingFlow:
                 "Tatkal Agent — session expired",
                 "IRCTC kicked the session at window open. Attempting re-login.",
             )
-            ok = await self.browser.login(config.username, config.password)
+            if config.manual_login:
+                ok = await self.browser.login_manual()
+            else:
+                ok = await self.browser.login(config.username, config.password)
             if not ok:
                 raise RuntimeError(
                     "Session expired at window open and re-login failed. "
@@ -305,6 +321,14 @@ class BookingFlow:
             await self.browser.navigate_to_booking()
             await self.browser.prefill_search_form(config)
             log.info("session_recovered", note="form_refilled_after_relogin")
+
+    async def _handle_aadhaar_otp(self) -> None:
+        handled = await self.browser.handle_aadhaar_otp_if_present()
+        if handled:
+            self._transition(BookingState.AWAITING_AADHAAR_OTP)
+            log.info("aadhaar_otp_cleared")
+        else:
+            log.debug("aadhaar_otp_not_present")
 
     async def _solve_captcha(self) -> None:
         # get_captcha_image() raises playwright.async_api.TimeoutError when
@@ -337,14 +361,16 @@ class BookingFlow:
 
 
 async def _countdown(target: datetime) -> None:
+    """`target` must be timezone-aware IST (see scheduler.calculate_booking_times) —
+    compared against the true IST instant, not the machine's local clock."""
     while True:
-        remaining = (target - datetime.now()).total_seconds()
+        remaining = (target - now_ist()).total_seconds()
         if remaining <= 0:
             print()
             return
         if remaining <= 5:
             print(
-                f"\r  [{datetime.now().strftime('%H:%M:%S')}]"
+                f"\r  [{now_ist().strftime('%H:%M:%S')} IST]"
                 f" ──── {remaining:.1f} seconds ────",
                 end="", flush=True,
             )

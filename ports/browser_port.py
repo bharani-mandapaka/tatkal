@@ -24,6 +24,18 @@ class BrowserPort(ABC):
     async def login(self, username: str, password: str) -> bool: ...
 
     @abstractmethod
+    async def login_manual(self) -> bool:
+        """
+        Navigate to IRCTC and let a human complete login themselves in the
+        visible browser window, then verify success. For use when automated
+        credential entry is being blocked by anti-bot detection at the auth
+        endpoint (confirmed live 2026-08-14: IRCTC's WAF returned HTTP 510
+        on the automated login POST while a manual login succeeded moments
+        earlier from the same machine).
+        """
+        ...
+
+    @abstractmethod
     async def is_logged_in(self) -> bool: ...
 
     @abstractmethod
@@ -52,6 +64,22 @@ class BrowserPort(ABC):
 
     @abstractmethod
     async def submit_passenger_form(self) -> None: ...
+
+    @abstractmethod
+    async def handle_aadhaar_otp_if_present(self) -> bool:
+        """
+        Check whether IRCTC is showing the Aadhaar-linked OTP prompt
+        (mandatory for all Tatkal bookings since July 2025). Its exact
+        position in the flow is unconfirmed — every live-tested run so far
+        has been GENERAL quota, which does not trigger it — so callers may
+        check at more than one point. Must return False near-instantly when
+        the prompt isn't present so it doesn't add latency to the common case.
+
+        If present: pause and let a human enter the OTP themselves in the
+        visible browser window (same hand-off pattern as login_manual()),
+        then return True once they confirm it's been submitted.
+        """
+        ...
 
     @abstractmethod
     async def get_booking_confirmation(self) -> dict: ...

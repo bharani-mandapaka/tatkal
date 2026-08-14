@@ -211,6 +211,74 @@ async def test_session_still_alive_at_window_open_does_not_relogin():
     assert browser.login.call_count == 1
 
 
+# ── Manual login (bot-detection fallback) ───────────────────────────────────────
+# Added 2026-08-14: automated login confirmed blocked live by IRCTC's WAF
+# (HTTP 510 on the auth POST) while manual login from the same machine
+# succeeded moments earlier. manual_login=True routes through
+# browser.login_manual() instead of browser.login(username, password).
+
+@pytest.mark.asyncio
+async def test_manual_login_true_uses_login_manual():
+    browser = _make_browser(is_logged_in_seq=[True])
+    browser.login_manual.return_value = True
+    flow = _make_flow(browser)
+
+    config = _config()
+    config.manual_login = True
+
+    with patch("core.booking_flow._countdown", new=AsyncMock()):
+        with patch("core.booking_flow.handle_payment", new=AsyncMock()):
+            try:
+                await flow.run(config, datetime.now())
+            except Exception:
+                pass
+
+    assert browser.login_manual.call_count == 1
+    browser.login.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manual_login_false_uses_automated_login():
+    """Regression guard: default (manual_login=False) must keep using the
+    existing automated login(username, password) path unchanged."""
+    browser = _make_browser(is_logged_in_seq=[True])
+    flow = _make_flow(browser)
+
+    with patch("core.booking_flow._countdown", new=AsyncMock()):
+        with patch("core.booking_flow.handle_payment", new=AsyncMock()):
+            try:
+                await flow.run(_config(), datetime.now())
+            except Exception:
+                pass
+
+    assert browser.login.call_count == 1
+    browser.login_manual.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_manual_login_used_again_on_force_logout_recovery():
+    """If manual_login=True and IRCTC force-logs-out the session at window
+    open, the recovery re-login must also go through login_manual(), not
+    silently fall back to automated login (which is what's being blocked)."""
+    browser = _make_browser(is_logged_in_seq=[False])   # force-expired at T=0
+    browser.login_manual.return_value = True
+    flow = _make_flow(browser)
+
+    config = _config()
+    config.manual_login = True
+
+    with patch("core.booking_flow._countdown", new=AsyncMock()):
+        with patch("core.booking_flow.handle_payment", new=AsyncMock()):
+            try:
+                await flow.run(config, datetime.now())
+            except Exception:
+                pass
+
+    # Initial login + recovery login, both through login_manual()
+    assert browser.login_manual.call_count == 2
+    browser.login.assert_not_called()
+
+
 # ── Session keepalive ─────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
@@ -396,3 +464,68 @@ async def test_waitlisted_availability_proceeds_when_confirmed_not_required():
 
     # fill_passenger_details must have been called (flow did not abort at WL)
     browser.fill_passenger_details.assert_awaited()
+
+
+# ── Aadhaar OTP hand-off ─────────────────────────────────────────────────────
+# Added 2026-08-14. Mandatory for Tatkal since July 2025; GENERAL quota (the
+# only path live-tested so far) never triggers it, so the exact position in
+# the flow is unconfirmed. The flow checks after CAPTCHA-solving and again
+# after submit — these tests pin that both checkpoints exist and that the
+# common case (prompt absent) doesn't change behaviour.
+
+@pytest.mark.asyncio
+async def test_aadhaar_otp_checked_at_both_checkpoints_when_absent():
+    """
+    Default mock: handle_aadhaar_otp_if_present() returns a truthy MagicMock
+    (unconfigured AsyncMock default) — what matters here is that the browser
+    port method is actually invoked at both points in the flow, not left
+    unwired. Real absence (False) is covered by the JS-heuristic itself,
+    which is Playwright-only and out of scope for these mocked-browser tests.
+    """
+    browser = _make_browser()
+    flow = _make_flow(browser)
+
+    with patch("core.booking_flow._countdown", new=AsyncMock()):
+        with patch("core.booking_flow.handle_payment", new=AsyncMock()):
+            try:
+                await flow.run(_config(), datetime.now())
+            except Exception:
+                pass
+
+    assert browser.handle_aadhaar_otp_if_present.call_count == 2, (
+        "Expected one check after CAPTCHA-solving and one after submit, "
+        f"got {browser.handle_aadhaar_otp_if_present.call_count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_aadhaar_otp_present_does_not_abort_flow():
+    """
+    When the OTP prompt is detected and the human clears it (browser method
+    returns True), the flow must proceed to payment, not treat it as a
+    failure.
+    """
+    browser = _make_browser()
+    browser.handle_aadhaar_otp_if_present.return_value = True
+    flow = _make_flow(browser)
+
+    with patch("core.booking_flow._countdown", new=AsyncMock()):
+        with patch("core.booking_flow.handle_payment", new=AsyncMock()) as mock_pay:
+            await flow.run(_config(), datetime.now())
+
+    mock_pay.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aadhaar_otp_absent_flow_still_reaches_payment():
+    """Regression guard: explicit False (prompt never appears, e.g. GENERAL
+    quota) must behave exactly like today — flow reaches payment unaffected."""
+    browser = _make_browser()
+    browser.handle_aadhaar_otp_if_present.return_value = False
+    flow = _make_flow(browser)
+
+    with patch("core.booking_flow._countdown", new=AsyncMock()):
+        with patch("core.booking_flow.handle_payment", new=AsyncMock()) as mock_pay:
+            await flow.run(_config(), datetime.now())
+
+    mock_pay.assert_awaited()
