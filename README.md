@@ -336,7 +336,27 @@ CAPTCHA ports** — no real browser or IRCTC needed for unit tests. See
 
 ## ⚖️ Legal
 
-This software is provided for **personal and educational use only**. Automated booking
-may violate IRCTC's Terms of Service. You are solely responsible for how you use it. The
-authors accept no liability for account actions, failed bookings, or financial loss. Do
-not use it to book tickets for others or to run a commercial service.
+This software is provided for **personal and educational use only**. You are solely
+responsible for how you use it. The authors accept no liability for account actions,
+failed bookings, or financial loss. Do not use it to book tickets for others or to run
+a commercial service. Researched 2026-08-18 — read this before relying on the tool:
+
+- **IRCTC's Terms & Conditions explicitly prohibit automation/scripting software**,
+  independent of intent or payment. This is a straightforward contract violation if
+  detected — expect **account deactivation and ticket cancellation** as the baseline
+  risk, every time, regardless of anything below.
+- **Section 143 of the Railways Act, 1989** criminalizes running the *"business"* of
+  procuring/supplying tickets for others (up to 3 years / ₹10,000 fine, 1-month/₹5,000
+  minimum). Every prosecuted software case found (Super Tatkal, "Neo") involved payment
+  from third parties or CAPTCHA/OTP bypass — the latter also drew separate **IT Act**
+  charges. No case of prosecution for purely personal, unpaid, single-family use was
+  found — but treat that as an enforcement gap, not legal clearance.
+- **Closest analog**: a 2024 Tatkal-autofill browser extension ("Tatkalforsure") had its
+  §143 case **quashed by the Karnataka High Court**, on the reasoning that the developer
+  didn't procure/supply tickets — users booked their own. Not a Supreme Court precedent,
+  and the developer was still arrested and had to litigate for months before it was
+  cleared.
+- This tool's manual-login, manual-CAPTCHA/OTP design is closer to that lower-risk
+  pattern than to the bot-detection-bypassing tools that drew IT Act charges — but that
+  is not the same as being legal. **This is not legal advice; consult a lawyer before
+  relying on this for a real booking, especially for anyone other than yourself.**
