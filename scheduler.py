@@ -17,6 +17,12 @@ _NTP_UNIX_DELTA = 2208988800
 # timezone, not just wrong time) can't silently fire the booking hours off.
 IST = ZoneInfo("Asia/Kolkata")
 
+# Only these quotas have a fixed IRCTC opening time (10:00 AC / 11:00 non-AC,
+# exactly one day before travel). GENERAL, LADIES, and other non-Tatkal
+# quotas can be booked any time within the normal reservation period —
+# there is nothing to wait for.
+TATKAL_QUOTAS = {"TATKAL", "PREMIUM TATKAL"}
+
 
 def now_ist() -> datetime:
     return datetime.now(IST)
@@ -51,7 +57,15 @@ def get_ntp_offset(server: str = "pool.ntp.org", timeout: float = 3.0) -> float:
 
 def calculate_booking_times(config: BookingConfig) -> tuple[datetime, datetime]:
     """Return (login_time, window_open_time) for the given config, anchored to
-    IST regardless of the machine's own timezone configuration."""
+    IST regardless of the machine's own timezone configuration.
+
+    Non-Tatkal quotas (GENERAL, LADIES, ...) have no fixed opening time —
+    fire immediately instead of waiting for a Tatkal-style 10/11 AM window
+    that doesn't apply to them."""
+    if config.quota.upper() not in TATKAL_QUOTAS:
+        immediate = now_ist()
+        return immediate, immediate
+
     day, month, year = config.journey_date.split("-")
     journey_dt = datetime(int(year), int(month), int(day), tzinfo=IST)
     booking_date = journey_dt - timedelta(days=1)

@@ -36,7 +36,17 @@ your browser, as your own IRCTC session.**
     yet reach the review or payment page. A likely-cause fix has been applied (an
     insurance-decline field that could fail to select silently) but is **not yet
     live-verified**.
+  - 🔧 **Availability-reading fix applied, not yet live-verified**: IRCTC only fetches
+    a class's fare/availability once its tab is clicked — reading it without clicking
+    first always reported "no seats" even when seats were available. A fix that clicks
+    the class tab before reading is in place but hasn't completed a clean end-to-end
+    live confirmation yet. See [TASKS.md](TASKS.md) for details.
   - See [TASKS.md](TASKS.md) for the live debugging log and root-cause notes.
+- **Space out live login attempts.** Repeated manual logins in a short window (several
+  within an hour or two) appear to trip IRCTC's own rate-limiting — a
+  `"Unable to Process your request, please try later"` message, unrelated to
+  credentials. Don't loop live diagnostic runs back-to-back; wait several minutes
+  between them.
 - Always keep a human watching the run. The agent is an assistant, not an autopilot.
 
 > If you just want to understand or contribute to the code, everything below still
@@ -111,7 +121,26 @@ playwright install chromium
 
 ## ⚙️ Configuration
 
-You can supply your booking details in **two ways**. Pick one.
+You can supply your booking details in **three ways**. Pick one.
+
+### Option A0 — Chat window (recommended for a non-technical friend)
+
+Double-click **`Start Tatkal Agent.bat`**, or run:
+
+```bash
+python chat_ui.py
+```
+
+A small chat window opens and asks the same questions as Option A below, one at a
+time — click buttons for choices (gender, berth, payment method, class priority...),
+type into the box for everything else. Nothing is written to disk. Once you confirm
+the summary, the chat window closes and a browser opens — the booking runs exactly
+the same way as every other option here (same tested engine, just a friendlier way to
+get the details in). **Non-Tatkal quotas (GENERAL, LADIES) start booking immediately**
+instead of waiting for a 10/11 AM window, since they don't have one.
+
+A console window stays open behind the chat for anything that needs you directly
+(logging into IRCTC, CAPTCHA, Aadhaar OTP) — don't close it.
 
 ### Option A — Interactive run (simplest; nothing written to disk)
 
@@ -276,8 +305,11 @@ adapters/
   captcha_file.py        File-based CAPTCHA for automated dry runs
   notifier.py            Desktop notifications
 payment.py               UPI / e-Wallet / Card payment handling
-scheduler.py             Window-time calc + NTP clock-skew check
+scheduler.py             Window-time calc (quota-aware) + NTP clock-skew check
 config.py                Encrypt / decrypt the booking config
+chat_ui.py               Chat-window front end (Option A0) — Tkinter driver around
+                          a testable, Tkinter-free conversation_script() generator
+Start Tatkal Agent.bat   Double-click launcher for chat_ui.py
 collector.py             CLI collector (Option B1)
 main.py                  Entry point: collect | check | run
 run_interactive.py       Entry point: interactive 5-stage flow (Option A)

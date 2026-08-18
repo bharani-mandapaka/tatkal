@@ -55,10 +55,29 @@ class PlaywrightBrowser(BrowserPort):
 
     async def launch(self) -> None:
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=False,
-            args=["--start-maximized"],
-        )
+        # Prefer the real installed Chrome over Playwright's bundled
+        # Chromium-for-Testing build. Confirmed live (2026-08-18): a
+        # freshly-downloaded bundled Chromium got silently blocked from
+        # spawning at all ("spawn UNKNOWN" — no window, no visible error,
+        # the process just exited) on real hardware, almost certainly AV/
+        # security software distrusting a brand-new unrecognized .exe.
+        # The already-installed Chrome — something the machine has already
+        # seen and trusted through normal use — launched cleanly in the
+        # same environment seconds later. Falls back to bundled Chromium if
+        # Chrome isn't installed (e.g. a machine that only has Edge).
+        try:
+            self._browser = await self._playwright.chromium.launch(
+                headless=False,
+                channel="chrome",
+                args=["--start-maximized"],
+            )
+        except Exception as e:
+            log.warning("real_chrome_launch_failed", error=str(e)[:200],
+                        note="falling back to Playwright's bundled Chromium")
+            self._browser = await self._playwright.chromium.launch(
+                headless=False,
+                args=["--start-maximized"],
+            )
         # No user_agent override: a hardcoded UA string drifts out of sync
         # with the actual bundled Chromium version over time (was pinned to
         # Chrome/124 while the real installed build is 148) — a UA/fingerprint
@@ -488,7 +507,26 @@ class PlaywrightBrowser(BrowserPort):
                     date:   v("p-calendar[formcontrolname='journeyDate'] input"),
                 };
             }""")
-            missing = [k for k in ("origin", "dest", "date") if not rb.get(k)]
+            # A field can be non-empty but still wrong: if the autocomplete
+            # suggestion click didn't land, the raw typed code (e.g. "CGL")
+            # is left sitting in the input instead of the full matched
+            # station name (e.g. "CHENGALPATTU JN - CGL (KANCHIPURAM)").
+            # That silently sends a malformed search that IRCTC just
+            # ignores (page stays put, no results, no error). Checking for
+            # non-empty alone missed this -- require the station fields to
+            # actually look like a resolved suggestion (has a "(" and isn't
+            # just the bare code).
+            def _station_selected(value: str, code: str) -> bool:
+                v = (value or "").strip()
+                return bool(v) and "(" in v and v.upper() != code.strip().upper()
+
+            missing = []
+            if not _station_selected(rb.get("origin", ""), config.from_station):
+                missing.append("origin")
+            if not _station_selected(rb.get("dest", ""), config.to_station):
+                missing.append("dest")
+            if not rb.get("date"):
+                missing.append("date")
             if not missing:
                 break
             log.warning("prefill_incomplete_refilling", missing=str(missing))
@@ -706,7 +744,83 @@ class PlaywrightBrowser(BrowserPort):
             "[class*='train'], app-train-avl-enq", timeout=30_000
         )
 
-        badge_text: str = await self.page.evaluate("""(args) => {
+        # TEMP DEBUG: dump the matched card's real HTML so the click target
+        # can be identified from ground truth instead of guessed again.
+        try:
+            dbg_html = await self.page.evaluate("""(tn) => {
+                var cards = document.querySelectorAll('app-train-avl-enq');
+                var card = Array.from(cards).find(c => c.textContent.includes(tn));
+                return card ? card.outerHTML : '<<CARD NOT FOUND>>';
+            }""", train_number)
+            with open("card_dump.html", "w", encoding="utf-8") as f:
+                f.write(dbg_html)
+        except Exception:
+            pass
+
+        # A class's fare/availability panel starts out showing a "Refresh"
+        # placeholder and only fetches real data once that class box is
+        # clicked (confirmed against a live screenshot: "Sleeper (SL) /
+        # Refresh (arrow)" before click, "AVAILABLE-0223" + a date carousel
+        # after). This is not an ajax timing gap -- polling alone never
+        # finds it. The exact tag/class names of this widget aren't known,
+        # so find the click target by TEXT instead: the smallest (leaf-most)
+        # element containing "(SL)" is the class label; walk a few ancestor
+        # levels up from it looking for a nearby leaf containing "Refresh"
+        # and click that element's real screen coordinates (JS .click() is
+        # unreliable against Angular's zone.js -- a genuine mouse click is
+        # required, per this file's own established pattern elsewhere).
+        try:
+            target = await self.page.evaluate("""(args) => {
+                var tn = args[0], tc = args[1];
+                var cards = document.querySelectorAll('app-train-avl-enq');
+                var card = Array.from(cards).find(function(c) {
+                    return c.textContent.includes(tn);
+                });
+                if (!card) return null;
+                var all = Array.from(card.querySelectorAll('*'));
+                var needle = '(' + tc + ')';
+                // Leaf-most element whose OWN text includes the class label,
+                // i.e. none of its children also contain it.
+                var clsEl = all.find(function(el) {
+                    if (!el.textContent.trim().includes(needle)) return false;
+                    return !Array.from(el.children).some(function(ch) {
+                        return ch.textContent.trim().includes(needle);
+                    });
+                });
+                if (!clsEl) return null;
+                var search = clsEl;
+                for (var i = 0; i < 8 && search; i++) {
+                    var desc = Array.from(search.querySelectorAll('*'));
+                    // Outermost element whose combined text (including any
+                    // icon child, e.g. a refresh glyph <i>/<svg>) reads
+                    // "Refresh" and nothing much else -- NOT restricted to
+                    // childless leaves, since the icon itself is a child.
+                    var refreshEl = desc.find(function(el) {
+                        var t = el.textContent.trim();
+                        return /refresh/i.test(t) && t.length < 25;
+                    });
+                    if (refreshEl) {
+                        var r = refreshEl.getBoundingClientRect();
+                        return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+                    }
+                    search = search.parentElement;
+                }
+                return null;
+            }""", [train_number, travel_class])
+            if target:
+                await self.page.mouse.click(target["x"], target["y"])
+                log.info("read_availability_tab_clicked",
+                        train=train_number, cls=travel_class, x=target["x"], y=target["y"])
+                await asyncio.sleep(0.6)
+            else:
+                log.info("read_availability_no_refresh_target",
+                         train=train_number, cls=travel_class,
+                         note="assuming already active or class not on this train")
+        except Exception as e:
+            log.warning("read_availability_tab_click_failed",
+                        train=train_number, cls=travel_class, error=str(e)[:200])
+
+        js = """(args) => {
             var tn = args[0], tc = args[1];
             // Find the train card
             var cards = document.querySelectorAll('app-train-avl-enq');
@@ -737,10 +851,24 @@ class PlaywrightBrowser(BrowserPort):
             }
             // Fallback: return raw text from the card's availability area
             return (card.textContent.match(avlPat) || ['UNKNOWN'])[0];
-        }""", [train_number, travel_class])
+        }"""
+
+        # IRCTC loads the train-list shell first and fetches each class's
+        # availability badge via a separate async call a beat later. Reading
+        # the DOM immediately after the shell appears can catch that badge
+        # mid-load (still 'Refresh'/blank), which falls through to the literal
+        # 'UNKNOWN' sentinel even though real availability text arrives soon
+        # after. Poll briefly instead of reading once.
+        badge_text = "UNKNOWN"
+        attempts = 0
+        for attempts in range(1, 11):
+            badge_text = await self.page.evaluate(js, [train_number, travel_class])
+            if badge_text not in ("UNKNOWN", "NOT_FOUND", "CLASS_NOT_FOUND", ""):
+                break
+            await asyncio.sleep(0.4)
 
         log.info("read_availability", train=train_number, cls=travel_class,
-                 badge=badge_text)
+                 badge=badge_text, attempts=attempts)
         return badge_text or "UNKNOWN"
 
     # ── Intermediate booking/train-list page ─────────────────────────────────

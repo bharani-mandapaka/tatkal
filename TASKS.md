@@ -371,6 +371,44 @@ forwarding, ADB bridge) — but that's a v2 idea, not buildable+testable safely 
 
 ---
 
+## Chat-Window UX 💬 (2026-08-17)
+
+New requested product experience: user opens a browser and logs into IRCTC
+themselves, double-clicks a launcher, a chat window asks journey/passenger/
+payment details, then the agent kicks off booking — immediately for
+non-Tatkal quotas, or waits for the window for Tatkal ones. Real Tatkal
+window for this friend's trip is **tomorrow (Tue Aug 18)**, so today was
+build + test, not a live attempt.
+
+- [x] **`chat_ui.py`** — Tkinter chat window. Architecture: `conversation_script()`
+  is a plain generator with **zero Tkinter dependency** (uses `yield`/`yield from`
+  instead of `input()`) — `ChatApp` is a thin driver around it. This is what makes
+  it testable without a display: 8 tests in `tests/test_chat_ui_script.py` drive
+  the generator directly with `.send()`, covering the happy path, cancellation,
+  validation-retry loops (bad age/date re-prompts), and payment-method branching.
+  Additionally smoke-tested with **real Tk widgets** (not just the logic) — 23
+  checks walking the entire questionnaire via actual Entry/Button widgets, ending
+  on the cancel path so it never opens a real browser. All pass.
+- [x] **Fixed a real bug this surfaced**: `scheduler.calculate_booking_times()` (used
+  by every entry point, not just the new chat UI) always computed a Tatkal-style
+  10/11 AM window regardless of `config.quota` — GENERAL/LADIES bookings would have
+  waited for a window that doesn't apply to them. Added `TATKAL_QUOTAS` check; non-Tatkal
+  quotas now fire immediately (`login_time == window_time == now_ist()`). 5 new tests.
+- [x] Manual login is now **forced on** in the chat UI (no password question at all) —
+  automated login is confirmed dead (Akamai), so there's no reason to still ask.
+- [x] **`Start Tatkal Agent.bat`** — double-click launcher, `pause`s on error so a
+  crash doesn't just flash and vanish.
+- [x] README updated with the new Option A0.
+- [ ] **Not yet done**: an actual supervised run through `Start Tatkal Agent.bat`
+  end-to-end (real click-through by a human, real browser hand-off into
+  `booking_flow.py`) — the widget smoke test stops at the cancel button on purpose,
+  it never lets `_launch()` fire. The hand-off code itself is a thin, deliberately
+  unmodified reuse of the same wiring `run_interactive.py` already uses, but "wiring
+  reused correctly" and "actually verified" aren't the same claim — do one real
+  GENERAL-quota run today before trusting this tomorrow.
+
+---
+
 ## 🎯 Fix-First Order (recommended sequence)
 
 The single question "what first?" — answered. Do these in order; each gates the next.
@@ -553,3 +591,77 @@ TATKAL outside-hours → blocked at ARP). Deltas vs the built `browser.py`:
   field?) is blocking the form. *(browser.py submit_passenger_form / fill_passenger_details)*
 - [ ] ⚠️ **Caution:** avoid rapid repeated live logins to the real account (bot-detection
   risk). Space diagnostic runs out.
+
+---
+
+## Chat-UI Live Diagnosis — "shows no seats when seats are available" (2026-08-18)
+
+Root-caused via repeated live diagnostic runs (train 17644, MS→CGL, 30-09-2026, SL,
+GENERAL quota) against a real IRCTC session.
+
+### 🔴 Root cause #1 — FIXED: availability badge never rendered without a click
+`read_availability_for_class` read the DOM once and returned the literal string
+`"UNKNOWN"` whenever no `AVAILABLE`/`WL`/etc. text was found anywhere on the matched
+train card. Confirmed via live screenshots: each class box shows a **"Refresh ↻"**
+placeholder with no fare/availability data until that class is clicked — IRCTC only
+fetches a class's availability once its tab is activated. A 4-second polling retry
+(added first, in case it was just an ajax-timing gap) made no difference, proving it
+wasn't timing — the data genuinely isn't in the DOM pre-click.
+Fix: `read_availability_for_class` now finds the class label (e.g. "(SL)") by text,
+walks a few ancestor levels up looking for a nearby "Refresh" element, and clicks its
+real screen coordinates via `page.mouse.click()` (JS `.click()` doesn't reliably
+trigger Angular's zone.js) before reading the badge. *(browser.py)*
+- First attempt at the click-target search required the matched element to have
+  `children.length === 0` (a true DOM leaf) — but "Refresh" almost certainly wraps an
+  icon glyph as a child element, so the filter skipped right past the real target.
+  Removed that constraint and increased the ancestor search depth 4→8. **Not yet
+  verified live** — next login attempt will confirm.
+
+### 🔴 Root cause #2 — FIXED: destination field could silently hold the raw code
+On one run the whole search failed (`app-train-avl-enq` never appeared) because the
+destination field held just `"CGL"` instead of the autocomplete-resolved
+`"CHENGALPATTU JN - CGL (KANCHIPURAM)"` — the suggestion click hadn't landed, and the
+old verification loop only checked "is the field non-empty", so it didn't notice.
+Fix: `prefill_search_form`'s readback now requires the field to actually look like a
+resolved station name (contains `"("` and isn't just the bare code), re-filling if not.
+*(browser.py prefill_search_form)*
+
+### 🟡 Investigated and reverted — NOT the login problem
+One diagnostic run got `"Unable to Process your request, please try later"` on manual
+login (same credentials that worked seconds later in the user's normal Chrome). Added
+`ignore_default_args=["--enable-automation"]` + `--disable-blink-features=
+AutomationControlled` + a `navigator.webdriver` JS patch, suspecting IRCTC was
+detecting the CDP-controlled browser itself. **Reverted** — login had already
+succeeded via plain manual login 3+ times earlier the same session with none of this,
+so the patch wasn't fixing a real baseline problem and a naive `navigator.webdriver`
+override can itself read as MORE suspicious to sophisticated bot detection (a
+non-native property descriptor is its own tell). Far more likely explanation: this is
+the exact "avoid rapid repeated live logins" risk noted above — the login endpoint was
+hit 6+ times in ~2 hours of diagnostic runs today, plausibly tripping IRCTC's own
+rate-limiting rather than anything automation-specific. **Lesson reinforced: space out
+live login attempts, especially during active debugging sessions.**
+
+### Also fixed in passing
+- `chat_ui.py`'s real booking run now always writes a timestamped file log
+  (`booking_YYYYMMDD_HHMMSS.log`), not console-only — the original bug report
+  ("console auto closed, lost the trace") can't recur.
+- `_build_captcha_adapter` in both `chat_ui.py` and `run_interactive.py` was missing
+  the required `notifier` arg to `ManualCaptchaAdapter(notifier)` — silent `TypeError`
+  after the chat completed, with no visible error since it fired after
+  `root.destroy()`. Fixed in both, plus wrapped `_launch()` in try/except so any future
+  exception prints a traceback and pauses instead of vanishing.
+- `adapters/browser.py launch()` now prefers the user's real installed Chrome
+  (`channel="chrome"`) over Playwright's bundled Chromium-for-Testing, which was
+  getting silently blocked from spawning at all on this machine (likely AV
+  distrusting a freshly-downloaded unrecognized .exe) — falls back to bundled
+  Chromium if real Chrome isn't installed.
+- `scheduler.calculate_booking_times` now fires immediately for non-Tatkal quotas
+  instead of waiting for an inapplicable 10/11 AM window.
+
+### Still open
+- [ ] Live-verify the availability-click fix (root cause #1) end-to-end — badge should
+  read a real `AVAILABLE-xxxx` value, not `UNKNOWN`.
+- [ ] A temporary debug block in `read_availability_for_class` dumps the matched
+  card's HTML to `card_dump.html` on every call — remove once the click fix is
+  confirmed working live.
+- [ ] Still no first-ever confirmed real PNR.

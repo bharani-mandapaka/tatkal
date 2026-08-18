@@ -4,6 +4,12 @@ session.json
 confirmation_*.png
 booking_result_*.json
 session_*.log
+booking_*.log
+diag_availability.log
+dump_card_html.log
+card_dump.html
+_diag_run.bat
+_dump_run.bat
 __pycache__/
 *.pyc
 .pytest_cache/

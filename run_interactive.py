@@ -31,7 +31,7 @@ from scheduler import now_ist
 log = get_logger()
 
 
-def _build_captcha_adapter(config):
+def _build_captcha_adapter(config, notifier):
     """Build the best available CAPTCHA adapter."""
     api_key = config.captcha_api_key or os.environ.get("TWOCAPTCHA_API_KEY")
     if api_key:
@@ -39,7 +39,7 @@ def _build_captcha_adapter(config):
         return TwoCaptchaAdapter(api_key), None
 
     from adapters.captcha_manual import ManualCaptchaAdapter
-    return ManualCaptchaAdapter(), None
+    return ManualCaptchaAdapter(notifier), None
 
 
 def _window_datetime(config, override: time | None) -> datetime:
@@ -76,7 +76,7 @@ async def main() -> None:
     from core.booking_flow import BookingFlow
 
     notifier = Notifier()
-    captcha, captcha_fallback = _build_captcha_adapter(config)
+    captcha, captcha_fallback = _build_captcha_adapter(config, notifier)
     browser = PlaywrightBrowser()
     flow = BookingFlow(browser, captcha, captcha_fallback, notifier, dry_run=False)
 

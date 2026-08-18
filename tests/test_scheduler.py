@@ -7,11 +7,11 @@ from core.models import BookingConfig, TravelClass, PaymentConfig, PaymentMethod
 from scheduler import calculate_booking_times, wait_until, now_ist
 
 
-def _cfg(cls: TravelClass, date: str = "27-05-2026") -> BookingConfig:
+def _cfg(cls: TravelClass, date: str = "27-05-2026", quota: str = "TATKAL") -> BookingConfig:
     return BookingConfig(
         username="t", password="t", train_number="12951",
         from_station="NDLS", to_station="MAS",
-        journey_date=date, travel_class=cls,
+        journey_date=date, travel_class=cls, quota=quota,
         passengers=[], mobile="9999999999",
         payment=PaymentConfig(method=PaymentMethod.UPI, upi_id="t@upi"),
     )
@@ -47,6 +47,40 @@ def test_cc_is_ac_class():
 def test_two_s_is_non_ac():
     _, window = calculate_booking_times(_cfg(TravelClass.TWO_S))
     assert window.hour == 11
+
+
+# ── Non-Tatkal quotas fire immediately (no fixed opening time) ─────────────────
+
+def test_general_quota_fires_immediately():
+    """GENERAL has no 10/11 AM window — login_time and window_time must both
+    collapse to 'now', not the Tatkal-style day-before calculation."""
+    before = now_ist()
+    login, window = calculate_booking_times(_cfg(TravelClass.SL, quota="GENERAL"))
+    after = now_ist()
+    assert before <= login <= after
+    assert login == window
+
+
+def test_ladies_quota_fires_immediately():
+    login, window = calculate_booking_times(_cfg(TravelClass.SL, quota="LADIES"))
+    assert login == window
+
+
+def test_tatkal_quota_still_uses_fixed_window():
+    """Regression guard: TATKAL (the default) must be unaffected by the
+    non-Tatkal fast-path."""
+    _, window = calculate_booking_times(_cfg(TravelClass.SL, quota="TATKAL"))
+    assert window.hour == 11
+
+
+def test_premium_tatkal_quota_still_uses_fixed_window():
+    _, window = calculate_booking_times(_cfg(TravelClass.TWO_A, quota="PREMIUM TATKAL"))
+    assert window.hour == 10
+
+
+def test_quota_check_is_case_insensitive():
+    login, window = calculate_booking_times(_cfg(TravelClass.SL, quota="general"))
+    assert login == window
 
 
 # ── Timezone-awareness (booking windows are IST regardless of machine tz) ──────
